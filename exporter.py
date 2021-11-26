@@ -1,19 +1,15 @@
 """Converts Evernote HTML files to Markdown."""
 import argparse
+import logging
+import json
 import os
 import re
-import sys
+from itertools import chain
 from html.parser import HTMLParser
 
 
-def decode_style(prop):
-    """Decode style-specific attributes."""
-    tokens = [t.strip() for t in prop.split(';') if t]
-    tokens = dict([tuple(x.strip() for x in t.split(':')) for t in tokens])
-    # handle aliases
-    tokens['text-decoration'] = tokens.pop('text-decoration-line',
-                                           tokens.get('text-decoration', None))
-
+def parse_span_style(tokens):
+    """Parse the style of span elements."""
     style = {}
     style['italic'] = tokens.get('font-style', None) == 'italic'
     style['bold'] = tokens.get('font-weight', None) == 'bold'
@@ -22,6 +18,24 @@ def decode_style(prop):
     style['code'] = "courier" in tokens.get('font-family', "").lower()
 
     return style
+
+
+def parse_div_style(tokens):
+    """Parse the style of div elements."""
+    style = {}
+    style['codeblock'] = tokens.get("-en-codeblock", "") == "true"
+    return style
+
+
+def decode_style(prop, parser=parse_span_style):
+    """Decode style-specific attributes."""
+    tokens = [t.strip() for t in prop.split(';') if t]
+    tokens = dict([tuple(x.strip() for x in t.split(':')) for t in tokens])
+    # handle aliases
+    tokens['text-decoration'] = tokens.pop('text-decoration-line',
+                                           tokens.get('text-decoration', None))
+
+    return parser(tokens)
 
 
 def _format(string, attr, warn=True):
@@ -34,7 +48,7 @@ def _format(string, attr, warn=True):
         string = string.replace(u"\xc2\xa0", " ").strip()
         if not string:  # nothing left
             if warn:
-                print("Empty code detected", file=sys.stderr)
+                logging.warning("Empty code detected")
                 return "<empty code>"
             return ""
         string = f"`{string}`"
@@ -44,14 +58,34 @@ def _format(string, attr, warn=True):
         string = f"<sub>{string}</sub>"
     if attr.get('underline', False):
         string = f"<u>{string}</u>"
-    if attr.get('link', None):
-        string = f"[{string}]({attr['link']})"
     if attr.get('italic', False):
         string = f"*{string}*"
     if attr.get('bold', False):
         string = f"**{string}**"
+    if attr.get('link', None):
+        string = f"[{string}]({attr['link']})"
 
     return string
+
+
+def _replace_cr_except_code(txt, langs, cr_):
+    """Replace single newlines except for bullet lists and code blocks."""
+    codeblocks = list(re.finditer(r"```bash([\S|\s]+?)```", txt))
+    if langs and len(codeblocks) != len(langs):
+        raise ValueError("Wrong number of code block hints.")
+
+    steps = [0] + list(chain(*[c.span() for c in codeblocks])) + [len(txt)]
+    segs = [txt[s:e] for s, e in zip(steps[:-1], steps[1:])]
+
+    for idx, seg in enumerate(segs):
+        if idx % 2 == 0:
+            segs[idx] = re.sub(r"(\S)\n([^\n-])", rf"\1{cr_}\n\2", seg)
+        elif langs:
+            lang = langs[idx // 2]
+            if lang != "bash":
+                segs[idx] = re.sub("```bash", f"```{lang}", seg)
+
+    return ''.join(segs)
 
 
 # check: https://docs.python.org/3/library/html.parser.html
@@ -61,22 +95,29 @@ class HTMLMDParser(HTMLParser):
     def __init__(self):
         """Initialize parser for a single document."""
         super(HTMLMDParser, self).__init__()
-        self.tags, self.last, self.span_keys = [], None, []
+        self.tags, self.last, self.div_lvl = [], None, 0
         self.attr, self.running, self.txt = {}, False, ""
 
     def handle_starttag(self, tag, attrs):
         """Handle state update for a new tag."""
-        # print("Start tag:", tag)
+        logging.debug("Start tag: %s", tag)
         self.tags.append(tag)
         attrs = dict(attrs)
+
         if tag == 'span':
             if self.last == 'span':
                 # hack: avoid bad syntax with two close spans
                 self.txt += " "
             if 'style' in attrs:
                 self.attr = decode_style(attrs['style'])
-                self.span_keys = list(self.attr.keys())
+        elif tag == 'div' and 'style' in attrs:
+            attr = decode_style(attrs['style'], parse_div_style)
+            if attr.get('codeblock', False):
+                self.div_lvl = len(self.tags)
+                self.txt += "\n```bash\n"
         elif tag == 'a' and 'href' in attrs:
+            if 'style' in attrs:
+                self.attr = decode_style(attrs['style'])
             self.attr['link'] = attrs['href'].replace(" ", "_")
         elif tag == 'u':
             self.attr['underline'] = True
@@ -98,14 +139,17 @@ class HTMLMDParser(HTMLParser):
         if self.tags[-1] != tag:
             raise ValueError(f"Unmatched tags, {tag} closing {self.tags[-1]}")
 
-        if tag in ('div', 'ul'):
+        if tag == 'ul':
+            self.txt += "\n"
+        elif tag == 'div':
+            if len(self.tags) == self.div_lvl:
+                self.div_lvl = 0
+                self.txt += "```"
             self.txt += "\n"
         elif tag == 'h1':
             self.txt += "\n\n"
-        elif tag == 'span':
+        elif tag in ('span', 'a'):
             self.attr = {}
-        elif tag == 'a':
-            self.attr.pop('link', None)
         elif tag == 'u':
             self.attr.pop('underline')
         elif tag == 'i':
@@ -126,14 +170,13 @@ class HTMLMDParser(HTMLParser):
 
         self.txt += _format(data, self.attr)
 
-    def finalize(self, cr_="<br>"):
+    def finalize(self, hints, cr_="<br>"):
         """Clean up residual formatting."""
         txt = self.txt.replace(u"\xc2\xa0", "&nbsp;")
         txt = re.sub(r"\n{3,}", "\n\n", txt)
         # remove lone nbsp - neded before single cr conversion
         txt = re.sub(r"\n\**(&nbsp;)+\**\n", "\n\n", txt)
-        # explicit single returns except for bullet lists
-        txt = re.sub(r"(\S)\n([^\n-])", rf"\1{cr_}\n\2", txt)
+        txt = _replace_cr_except_code(txt, hints.get('codeblocks', []), cr_)
 
         return txt.strip() + '\n'
 
@@ -148,15 +191,19 @@ def main():
                         help="print to stdout instead of writing files.")
     args = parser.parse_args()
 
+    with open("hints.json", 'r') as fid:
+        hints = json.load(fid)
+
     with open(args.path, 'r') as fid:
         txt = '\n'.join(line for line in fid)
     fname, _ = os.path.splitext(args.path)
+    name = os.path.basename(fname)
 
     parser = HTMLMDParser()
     parser.feed(txt)
     parser.close()
 
-    txt = parser.finalize(cr_=r"\\")
+    txt = parser.finalize(cr_=r"\\", hints=hints['files'].get(name, {}))
 
     if args.print:
         print(txt)
@@ -164,7 +211,6 @@ def main():
         with open(f"{fname}.md", 'w') as fid:
             fid.write(txt)
 
-    # TODO: fix code block
     # TODO: embed PDFs, videos, images
     # <object data="x.pdf" width="1000" height="1000" type='application/pdf'/>
     # <video muted autoplay controls>
@@ -173,4 +219,5 @@ def main():
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
     main()
