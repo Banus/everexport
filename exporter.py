@@ -6,7 +6,9 @@ import os
 import re
 from itertools import chain
 from html.parser import HTMLParser
-from urllib.parse import quote
+from urllib.parse import quote, unquote
+
+_IGNORED_TAGS = ['html', 'head', 'title', 'basefont', 'meta', 'style']
 
 
 def parse_span_style(tokens):
@@ -47,19 +49,19 @@ def _format(string, attr, warn=True):
 
     # flatten attributes
     attr_flat = {k: v for k, v in attr.items() if not isinstance(v, dict)}
-    attr = {**attr_flat, **{k: v for d in attr.values() if isinstance(d, dict)
-                            for k, v in d.items()}}
+    attr = {**{k: v for d in attr.values() if isinstance(d, dict)
+               for k, v in d.items()}, **attr_flat}
     or_str = string
 
     if attr.get('code', False):
         # spaces are non-breaking in code; remove leading/trailing spaces
-        string = string.replace(u"\xc2\xa0", " ").strip()
+        string = string.replace(chr(160), " ").strip()
         if not string:  # nothing left
             if warn:
                 logging.warning("Empty code detected")
                 return "<empty code>"
             return ""
-        string = f"`{string}`"
+        return f"`{string}`"  # no further formatting is possible
     if attr.get('sup', False):
         string = f"<sup>{string}</sup>"
     if attr.get('sub', False):
@@ -115,8 +117,9 @@ class HTMLMDParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         """Handle state update for a new tag."""
-        logging.debug("Start tag: %s", tag)
         self.tags.append(tag)
+        if tag in _IGNORED_TAGS:
+            return
         attrs = dict(attrs)
 
         if tag == 'span':
@@ -125,21 +128,17 @@ class HTMLMDParser(HTMLParser):
                 self.txt += " "
             if 'style' in attrs:
                 self.attr['span'] = decode_style(attrs['style'])
-        elif tag == 'div' and 'style' in attrs:
-            attr = decode_style(attrs['style'], parse_div_style)
-            if attr.get('codeblock', False):
-                self.div_lvl = len(self.tags)
-                self.txt += "\n```bash\n"
-        elif tag == 'a' and 'href' in attrs:
-            self.attr['a'] = {'link': attrs['href'].replace(" ", "_")}
+        elif tag == 'div':
             if 'style' in attrs:
-                self.attr['a'].update(decode_style(attrs['style']))
-        elif tag == 'u':
-            self.attr['underline'] = True
-        elif tag == 'i':
-            self.attr['italic'] = True
-        elif tag == 'sup':
-            self.attr['sup'] = True
+                attr = decode_style(attrs['style'], parse_div_style)
+                if attr.get('codeblock', False):
+                    self.div_lvl = len(self.tags)
+                    self.txt += "\n```bash\n"
+        elif tag == 'a':
+            if 'href' in attrs:
+                self.attr['a'] = {'link': quote(attrs['href'])}
+                if 'style' in attrs:
+                    self.attr['a'].update(decode_style(attrs['style']))
         elif tag == 'img':
             if self.attr.get('a', False):
                 # preview image for MP4/PDF, leave only link to file
@@ -149,7 +148,17 @@ class HTMLMDParser(HTMLParser):
             attr = f"alt=\"{name}\""
             attr += f" width={attrs['width']}" if 'width' in attrs else ""
             self.txt += f"<img src=\"{quote(attrs['src'])}\" {attr}>"
-        elif tag == 'ul':
+        elif tag == 'font':
+            self.attr['code'] = "Andale Mono" == attrs.get('face', "")
+        elif tag == 'u':
+            self.attr['underline'] = True
+        elif tag in ('i', 'em'):
+            self.attr['italic'] = True
+        elif tag in ('b', 'strong'):
+            self.attr['bold'] = True
+        elif tag == 'sup':
+            self.attr['sup'] = True
+        elif tag in ('ul', 'br'):
             self.txt += '\n'
         elif tag == 'li':
             self.txt += "- "
@@ -157,6 +166,8 @@ class HTMLMDParser(HTMLParser):
             self.txt += "# "
         elif tag == 'body':
             self.running = True
+        else:
+            logging.warning(f"Unknown tag: {tag}")
 
     def handle_endtag(self, tag):
         """Handle state update when closing a tag."""
@@ -173,6 +184,7 @@ class HTMLMDParser(HTMLParser):
             if len(self.tags) == self.div_lvl:
                 self.div_lvl = 0
                 self.txt += "```"
+                logging.debug("codeblock")
             self.txt += "\n"
         elif tag == 'h1':
             self.txt += "\n\n"
@@ -180,10 +192,14 @@ class HTMLMDParser(HTMLParser):
             self.attr.pop('span', False)
         elif tag == 'a':
             self.attr.pop('a', False)
+        elif tag == 'font':
+            self.attr.pop('code', False)
         elif tag == 'u':
             self.attr.pop('underline')
-        elif tag == 'i':
+        elif tag in ('i', 'em'):
             self.attr.pop('italic')
+        elif tag in ('b', 'strong'):
+            self.attr.pop('bold')
         elif tag == 'sup':
             self.attr.pop('sup')
         elif tag == 'body':
@@ -200,18 +216,31 @@ class HTMLMDParser(HTMLParser):
 
         if self.attr.get('a', {}).get('color', False):
             # colored links are internal
-            self.internal_links.append((data, self.attr['a']['link']))
+            self.internal_links.append((data, unquote(self.attr['a']['link'])))
         self.txt += _format(data, self.attr)
 
     def finalize(self, hints, cr_="<br>"):
         """Clean up residual formatting."""
-        txt = self.txt.replace(u"\xc2\xa0", "&nbsp;")
+        # txt = self.txt.replace(u"\xc2\xa0", "&nbsp;")
+        txt = self.txt.replace(chr(160), "&nbsp;")
         txt = re.sub(r"\n{3,}", "\n\n", txt)
         # remove lone nbsp - neded before single cr conversion
         txt = re.sub(r"\n\**(&nbsp;)+\**\n", "\n\n", txt)
+        # remove trailing spaces
+        txt = re.sub(r" *\n", "\n", txt)
         txt = _replace_cr_except_code(txt, hints.get('codeblocks', []), cr_)
 
         return txt.strip() + '\n'
+
+
+def convert_html_file(html, hints, cr_=r"\\"):
+    """Convert HTML to Markdown."""
+    parser = HTMLMDParser()
+    parser.feed(html)
+    parser.close()
+    txt = parser.finalize(hints, cr_)
+
+    return txt, parser.internal_links
 
 
 def main():
@@ -220,30 +249,43 @@ def main():
         description='Convert Evernote HTML to Markdown')
 
     parser.add_argument("path", type=str, help="file to convert")
-    parser.add_argument("-p", "--print", action="store_true",
-                        help="print to stdout instead of writing files.")
+    parser.add_argument("-r", "--recursive", action="store_true",
+                        help="recursively convert all files following links.")
     args = parser.parse_args()
 
     with open("hints.json", 'r') as fid:
         hints = json.load(fid)
 
-    with open(args.path, 'r') as fid:
-        txt = '\n'.join(line for line in fid)
-    fname, _ = os.path.splitext(args.path)
-    name = os.path.basename(fname)
+    links, external, converted = [os.path.split(args.path)], [], []
+    while links:
+        path, fname = links.pop()
+        logging.info(f"Converting {fname}")
+        converted.append(fname)
 
-    parser = HTMLMDParser()
-    parser.feed(txt)
-    parser.close()
+        with open(os.path.join(path, fname), 'r', encoding="utf-8") as fid:
+            txt = fid.read()
+        fname, _ = os.path.splitext(fname)
+        txt, curr_links = convert_html_file(txt, hints['files'].get(fname, {}))
 
-    txt = parser.finalize(cr_=r"\\", hints=hints['files'].get(name, {}))
-    print(parser.internal_links)
-
-    if args.print:
-        print(txt)
-    else:
-        with open(f"{fname}.md", 'w') as fid:
+        out_file = os.path.join(path, f"{fname}.md")
+        with open(out_file, 'w', encoding="utf-8") as fid:
             fid.write(txt)
+
+        if args.recursive:
+            links += [(path, f) for _, f in curr_links
+                      if not f.startswith('evernote')]
+            external += [(lbl, f) for lbl, f in curr_links
+                         if f.startswith('evernote')]
+
+    if external:
+        print("\nExternal links:")
+        for lbl, fname in external:
+            print(f"{lbl}: {fname}")
+    if args.recursive:
+        all_files = [f for f in os.listdir(path) if f.endswith('.html')]
+        print("\nMissing files:")
+        for fname in set(all_files) - set(converted):
+            print(f"{fname}")
 
 
 if __name__ == '__main__':
