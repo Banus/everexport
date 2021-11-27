@@ -6,6 +6,7 @@ import os
 import re
 from itertools import chain
 from html.parser import HTMLParser
+from urllib.parse import quote
 
 
 def parse_span_style(tokens):
@@ -16,6 +17,7 @@ def parse_span_style(tokens):
     style['underline'] = tokens.get('text-decoration', None) == 'underline'
     style['sub'] = tokens.get('vertical-align', None) == 'sub'
     style['code'] = "courier" in tokens.get('font-family', "").lower()
+    style['color'] = tokens.get('color', False)
 
     return style
 
@@ -43,6 +45,12 @@ def _format(string, attr, warn=True):
     if not attr:
         return string
 
+    # flatten attributes
+    attr_flat = {k: v for k, v in attr.items() if not isinstance(v, dict)}
+    attr = {**attr_flat, **{k: v for d in attr.values() if isinstance(d, dict)
+                            for k, v in d.items()}}
+    or_str = string
+
     if attr.get('code', False):
         # spaces are non-breaking in code; remove leading/trailing spaces
         string = string.replace(u"\xc2\xa0", " ").strip()
@@ -58,11 +66,17 @@ def _format(string, attr, warn=True):
         string = f"<sub>{string}</sub>"
     if attr.get('underline', False):
         string = f"<u>{string}</u>"
+    if attr.get('color', False):
+        string = f"<span style=\"color: {attr['color']}\">{string}</span>"
     if attr.get('italic', False):
         string = f"*{string}*"
     if attr.get('bold', False):
         string = f"**{string}**"
     if attr.get('link', None):
+        if attr['link'] == "https:":
+            logging.warning(f"Empty link found for {or_str}")
+        if attr.get('italic', False) and not attr.get('underline', False):
+            logging.warning(f"Entry not underlined: {or_str}")
         string = f"[{string}]({attr['link']})"
 
     return string
@@ -97,6 +111,7 @@ class HTMLMDParser(HTMLParser):
         super(HTMLMDParser, self).__init__()
         self.tags, self.last, self.div_lvl = [], None, 0
         self.attr, self.running, self.txt = {}, False, ""
+        self.internal_links = []
 
     def handle_starttag(self, tag, attrs):
         """Handle state update for a new tag."""
@@ -109,22 +124,31 @@ class HTMLMDParser(HTMLParser):
                 # hack: avoid bad syntax with two close spans
                 self.txt += " "
             if 'style' in attrs:
-                self.attr = decode_style(attrs['style'])
+                self.attr['span'] = decode_style(attrs['style'])
         elif tag == 'div' and 'style' in attrs:
             attr = decode_style(attrs['style'], parse_div_style)
             if attr.get('codeblock', False):
                 self.div_lvl = len(self.tags)
                 self.txt += "\n```bash\n"
         elif tag == 'a' and 'href' in attrs:
+            self.attr['a'] = {'link': attrs['href'].replace(" ", "_")}
             if 'style' in attrs:
-                self.attr = decode_style(attrs['style'])
-            self.attr['link'] = attrs['href'].replace(" ", "_")
+                self.attr['a'].update(decode_style(attrs['style']))
         elif tag == 'u':
             self.attr['underline'] = True
         elif tag == 'i':
             self.attr['italic'] = True
         elif tag == 'sup':
             self.attr['sup'] = True
+        elif tag == 'img':
+            if self.attr.get('a', False):
+                # preview image for MP4/PDF, leave only link to file
+                self.txt += _format(attrs['alt'], self.attr)
+                return
+            name = quote(attrs.get('data-filename', "")[:-4])
+            attr = f"alt=\"{name}\""
+            attr += f" width={attrs['width']}" if 'width' in attrs else ""
+            self.txt += f"<img src=\"{quote(attrs['src'])}\" {attr}>"
         elif tag == 'ul':
             self.txt += '\n'
         elif tag == 'li':
@@ -137,7 +161,11 @@ class HTMLMDParser(HTMLParser):
     def handle_endtag(self, tag):
         """Handle state update when closing a tag."""
         if self.tags[-1] != tag:
-            raise ValueError(f"Unmatched tags, {tag} closing {self.tags[-1]}")
+            if self.tags[-1] == 'img':  # occasional error
+                self.tags.pop()
+            else:
+                raise ValueError(
+                    f"Unmatched tags, {tag} closing {self.tags[-1]}")
 
         if tag == 'ul':
             self.txt += "\n"
@@ -148,8 +176,10 @@ class HTMLMDParser(HTMLParser):
             self.txt += "\n"
         elif tag == 'h1':
             self.txt += "\n\n"
-        elif tag in ('span', 'a'):
-            self.attr = {}
+        elif tag == 'span':
+            self.attr.pop('span', False)
+        elif tag == 'a':
+            self.attr.pop('a', False)
         elif tag == 'u':
             self.attr.pop('underline')
         elif tag == 'i':
@@ -168,6 +198,9 @@ class HTMLMDParser(HTMLParser):
         if not data.strip():  # only spaces
             return
 
+        if self.attr.get('a', {}).get('color', False):
+            # colored links are internal
+            self.internal_links.append((data, self.attr['a']['link']))
         self.txt += _format(data, self.attr)
 
     def finalize(self, hints, cr_="<br>"):
@@ -204,18 +237,13 @@ def main():
     parser.close()
 
     txt = parser.finalize(cr_=r"\\", hints=hints['files'].get(name, {}))
+    print(parser.internal_links)
 
     if args.print:
         print(txt)
     else:
         with open(f"{fname}.md", 'w') as fid:
             fid.write(txt)
-
-    # TODO: embed PDFs, videos, images
-    # <object data="x.pdf" width="1000" height="1000" type='application/pdf'/>
-    # <video muted autoplay controls>
-    # <source src="{{ site.my-media-path }}/myvideo.mp4" type="video/mp4">
-    # </video>
 
 
 if __name__ == '__main__':
