@@ -1,14 +1,17 @@
 """Converts Evernote HTML files to Markdown."""
 import argparse
+import codecs
 import logging
 import json
 import os
 import re
+
 from itertools import chain
 from html.parser import HTMLParser
 from urllib.parse import quote, unquote
 
 _IGNORED_TAGS = ['html', 'head', 'title', 'basefont', 'meta', 'style']
+_MONOSPACE_FONTS = ["Andale Mono", "Consolas", "Courier New", "Lucida Console"]
 
 
 def parse_span_style(tokens):
@@ -24,15 +27,21 @@ def parse_span_style(tokens):
     return style
 
 
-def parse_div_style(tokens):
-    """Parse the style of div elements."""
-    style = {}
-    style['codeblock'] = tokens.get("-en-codeblock", "") == "true"
-    return style
+def _parse_div_style(tokens):
+    return {'codeblock': tokens.get("-en-codeblock", "") == "true"}
+
+
+def _parse_font_style(tokens):
+    return {'code': "courier" in tokens.get('font-family', "").lower()}
 
 
 def decode_style(prop, parser=parse_span_style):
     """Decode style-specific attributes."""
+    if not prop:
+        return {}
+
+    # occasionally, Evernote drops the font-family attribute
+    prop = re.sub("\";} \"", "\"Courier New\"", prop)
     tokens = [t.strip() for t in prop.split(';') if t]
     tokens = dict([tuple(x.strip() for x in t.split(':')) for t in tokens])
     # handle aliases
@@ -48,10 +57,16 @@ def _format(string, attr, warn=True):
         return string
 
     # flatten attributes
-    attr_flat = {k: v for k, v in attr.items() if not isinstance(v, dict)}
-    attr = {**{k: v for d in attr.values() if isinstance(d, dict)
-               for k, v in d.items()}, **attr_flat}
+    attr_flat = {k: v for k, v in attr.items() if k not in ('a', 'span')}
+    attr_span = attr.get('span', [])
+    attr_span = attr_span[-1] if attr_span else {}
+    attr = {**attr.get('a', {}), **attr_span, **attr_flat}
+
     or_str = string
+    string = string.replace("<", r"\<").replace(">", r"\>")  # sanitize
+
+    if attr.get('color', "") == "rgb(0, 0, 0)":
+        attr.pop('color')  # remove default color
 
     if attr.get('code', False):
         # spaces are non-breaking in code; remove leading/trailing spaces
@@ -62,6 +77,9 @@ def _format(string, attr, warn=True):
                 return "<empty code>"
             return ""
         return f"`{string}`"  # no further formatting is possible
+
+    if attr.get('img', False):
+        string = attr['img']
     if attr.get('sup', False):
         string = f"<sup>{string}</sup>"
     if attr.get('sub', False):
@@ -82,6 +100,26 @@ def _format(string, attr, warn=True):
         string = f"[{string}]({attr['link']})"
 
     return string
+
+
+def _parse_img(state, attrs):
+    """Parse img tags."""
+    link = state.get('a', {}).get('link', "")
+    if link.endswith((".png", ".mp4")):
+        # preview image for MP4/PDF, leave only link to file
+        #  otherwise, keep the preview and link to generic file
+        return _format(attrs['alt'], state)
+
+    name = attrs.get('data-filename', "")[:-4] or attrs.get('alt', "")
+    name = quote(os.path.splitext(name)[0])
+    attr = [f" alt=\"{name}\"" if name else ""]
+    attr += [f" width={attrs['width']}" if 'width' in attrs else ""]
+    attr = ''.join(attr)
+
+    txt = f"<img src=\"{quote(attrs['src'])}\"{attr}>"
+    if link:
+        txt = f"[{txt}]({link})"
+    return txt
 
 
 def _replace_cr_except_code(txt, langs, cr_):
@@ -123,14 +161,15 @@ class HTMLMDParser(HTMLParser):
         attrs = dict(attrs)
 
         if tag == 'span':
-            if self.last == 'span':
+            if self.txt[-1] in ('*', '_'):
                 # hack: avoid bad syntax with two close spans
                 self.txt += " "
             if 'style' in attrs:
-                self.attr['span'] = decode_style(attrs['style'])
+                self.attr['span'] = self.attr.get('span', []) + [
+                    decode_style(attrs['style'])]
         elif tag == 'div':
             if 'style' in attrs:
-                attr = decode_style(attrs['style'], parse_div_style)
+                attr = decode_style(attrs['style'], _parse_div_style)
                 if attr.get('codeblock', False):
                     self.div_lvl = len(self.tags)
                     self.txt += "\n```bash\n"
@@ -140,16 +179,13 @@ class HTMLMDParser(HTMLParser):
                 if 'style' in attrs:
                     self.attr['a'].update(decode_style(attrs['style']))
         elif tag == 'img':
-            if self.attr.get('a', False):
-                # preview image for MP4/PDF, leave only link to file
-                self.txt += _format(attrs['alt'], self.attr)
-                return
-            name = quote(attrs.get('data-filename', "")[:-4])
-            attr = f"alt=\"{name}\""
-            attr += f" width={attrs['width']}" if 'width' in attrs else ""
-            self.txt += f"<img src=\"{quote(attrs['src'])}\" {attr}>"
+            self.txt += _parse_img(self.attr, attrs)
         elif tag == 'font':
-            self.attr['code'] = "Andale Mono" == attrs.get('face', "")
+            font = attrs.get('face', "")
+            self.attr['code'] = font in _MONOSPACE_FONTS or decode_style(
+                attrs.get('style', ""), _parse_font_style)
+            if font and font not in _MONOSPACE_FONTS:
+                logging.warning(f"Unknown font: {font}")
         elif tag == 'u':
             self.attr['underline'] = True
         elif tag in ('i', 'em'):
@@ -185,11 +221,14 @@ class HTMLMDParser(HTMLParser):
                 self.div_lvl = 0
                 self.txt += "```"
                 logging.debug("codeblock")
-            self.txt += "\n"
+            self.txt += "\n" if self.last != 'br' else ""
         elif tag == 'h1':
             self.txt += "\n\n"
         elif tag == 'span':
-            self.attr.pop('span', False)
+            if 'span' in self.attr and self.attr['span']:
+                self.attr['span'].pop()
+            else:
+                self.attr.pop('span', False)
         elif tag == 'a':
             self.attr.pop('a', False)
         elif tag == 'font':
@@ -212,6 +251,8 @@ class HTMLMDParser(HTMLParser):
         if not self.running:
             return
         if not data.strip():  # only spaces
+            if self.tags[-1] in ('span', 'div'):
+                self.txt += data  # formatting spaces may be in other tags
             return
 
         if self.attr.get('a', {}).get('color', False):
@@ -221,10 +262,13 @@ class HTMLMDParser(HTMLParser):
 
     def finalize(self, hints, cr_="<br>"):
         """Clean up residual formatting."""
-        # txt = self.txt.replace(u"\xc2\xa0", "&nbsp;")
+        # fix special characters
         txt = self.txt.replace(chr(160), "&nbsp;")
-        txt = re.sub(r"\n{3,}", "\n\n", txt)
-        # remove lone nbsp - neded before single cr conversion
+        txt = txt.replace(codecs.BOM_UTF8.decode('utf-8'), "")
+
+        # remove multiple empty lines
+        txt = re.sub(r"\n\n\n+", "\n\n", txt)
+        # remove lone nbsp - needed before single cr conversion
         txt = re.sub(r"\n\**(&nbsp;)+\**\n", "\n\n", txt)
         # remove trailing spaces
         txt = re.sub(r" *\n", "\n", txt)
