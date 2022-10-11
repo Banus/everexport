@@ -12,7 +12,8 @@ from urllib.parse import quote
 from bs4 import BeautifulSoup, NavigableString
 
 
-_MONOSPACE_FONTS = ["Andale Mono", "Consolas", "Courier New", "Lucida Console"]
+_MONOSPACE_FONTS = ["Andale Mono", "Consolas", "Courier New", "Lucida Console",
+                    "courier new, courier, monospace"]
 COLOR_INTERNAL_LINKS = True
 INLINE_PREVIEWS = True
 
@@ -52,11 +53,11 @@ def _parse_img(tag):
 
 def _escape(string):
     """Escape reserved Markdown characters."""
-    return string.replace("<", r"\<").replace(">", r"\>")
+    return string.replace("<", r"\<").replace(">", r"\>").replace("$", r"\$")
 
 def _unescape(string):
     """Unescape reserved Markdown characters for codeblocks."""
-    return string.replace(r"\>", ">").replace(r"\<", "<")
+    return string.replace(r"\>", ">").replace(r"\<", "<").replace(r"\$", "$")
 
 
 def decode_style(prop, parser=parse_span_style):
@@ -75,6 +76,40 @@ def decode_style(prop, parser=parse_span_style):
     return parser(tokens)
 
 
+def convert_tr(el, text):
+    """Convert table rows; from Markdownify."""
+    cells = el.find_all(['td', 'th'])
+    is_headrow = all([cell.name == 'th' for cell in cells])
+    overline = ''
+    underline = ''
+    if is_headrow and not el.previous_sibling:
+        # first row and is headline: print headline underline
+        underline += '| ' + ' | '.join(['---'] * len(cells)) + ' |' + '\n'
+    elif (not el.previous_sibling
+            and (el.parent.name == 'table'
+                or (el.parent.name == 'tbody'
+                    and not el.parent.previous_sibling))):
+        # first row, not headline, and:
+        # - the parent is table or
+        # - the parent is tbody at the beginning of a table.
+        # print empty headline above this row
+        overline += '| ' + ' | '.join([''] * len(cells)) + ' |' + '\n'
+        overline += '| ' + ' | '.join(['---'] * len(cells)) + ' |' + '\n'
+    return overline + '|' + text + '\n' + underline
+
+
+def _clean_code_block(string):
+    """Clean code blocks."""
+    # spaces are non-breaking in code; remove leading/trailing spaces
+    string = string.replace("&nbsp;", " ")
+    string = _unescape(string.replace(chr(160), " ").strip())
+
+    if not string:  # nothing left
+        logging.warning("Empty code detected")
+        
+    return string
+
+
 def _format(string, attr, warn=True):
     """Add formats to string; beware of the order."""
     if not attr or not string.strip():
@@ -85,14 +120,10 @@ def _format(string, attr, warn=True):
 
     if attr.get('code', False):
         # spaces are non-breaking in code; remove leading/trailing spaces
-        string = _unescape(string.replace(chr(160), " ").strip())
-        if not string:  # nothing left
-            if warn:
-                logging.warning("Empty code detected")
-                return "<empty code>"
-            return ""
-        return f"`{string}`"  # no further formatting is possible
-    
+        string = _clean_code_block(string)
+        # no further formatting is possible
+        return f"`{string}`" if string else ""
+
     or_str = string
     if attr.get('sup', False):
         string = f"<sup>{string}</sup>"
@@ -145,7 +176,7 @@ def finalize(txt, hints, cr_="<br>"):
     # remove lone nbsp - needed before single cr conversion
     txt = re.sub(r"\n\**(&nbsp;)+\**\n", "\n\n", txt)
     # # nbsp not at line start are spaces
-    # txt = re.sub(r"([^\n])(&nbsp;)", r"\1 ", txt)
+    txt = re.sub(r"&nbsp;(?![&nbsp;| |*]+)", " ", txt)
     # remove trailing spaces
     txt = re.sub(r" *\n", "\n", txt)
     txt = _replace_cr_except_code(txt, hints.get('codeblocks', []), cr_)
@@ -177,9 +208,12 @@ class HTMLParser():
 
     def _parse_link(self, tag, txt, style):
         """Format a link."""
-        link = tag.get('href', '')
-        if not link or link == "https:":
-            logging.warning(f"Empty link found for {tag.text}")
+        link, name = tag.get('href', ''), tag.get('name', '')
+        if name:  # anchor, drop it
+            return tag.text, {}
+
+        if not link or link == "https:":  # anchor or empty link
+            logging.warning(f"Empty link found for {txt}")
             return tag.text, {}
         if link == tag.text:
             return tag.text, {}  # use autolink
@@ -189,8 +223,8 @@ class HTMLParser():
 
         if '://' not in link:  # internal link
             if link.endswith('.html'):
-                link = link.replace(".html", ".md")
                 self.internal_links.append((tag.text, link))
+                link = link.replace(".html", ".md")
             elif link.endswith(('.mp4', '.pdf')) and INLINE_PREVIEWS:
                 # discard preview image and link file directly
                 txt = os.path.basename(link)
@@ -199,30 +233,39 @@ class HTMLParser():
                 # remove color for internal links
                 style.pop('color')
             link = quote(link)
+        elif inter:
+            logging.warning(f"Unresolved internal link: {txt} {link}")
 
         style['link'] = link
         return txt, style
     
     def _merge(self, children):
         """Merge text from children."""
-        if all(c.name == 'span' for c in children):
-            return self._merge_spans(children)
-
-        txt, chunks = "", []
+        tag_name, txt, style, chunks, running = "", "", {}, [], False
         for tag in children:
-            old_txt = txt
+            old_name, old_txt, old_style = tag_name, txt, style
             txt, style = self.process_tag(tag)
-            if tag.name == 'div' and not old_txt.endswith('\n'):
+            tag_name = tag.name
+
+            if tag_name == 'span':
+                # delay adding spans to chunks and check for consecutive spans
+                running = True
+                if old_name == 'span':
+                    if style == old_style:
+                        txt = old_txt + txt
+                    else:
+                        chunks.append(_format(old_txt, old_style))
+                continue
+            elif running and tag_name != 'span':
+                chunks.append(_format(old_txt, old_style))
+                running = False
+            if tag_name == 'div' and not old_txt.endswith('\n'):
                 txt = '\n' + txt
             chunks.append(_format(txt, style))
+        
+        if running:
+            chunks.append(_format(txt, style))
         return ''.join(chunks)
-    
-    def _merge_spans(self, children):
-        """Merge text from children."""
-        txts, styles = zip(*[self.process_tag(c) for c in children])
-        if all(s == styles[0] for s in styles):
-            return _format(''.join(txts), styles[0])
-        return ''.join(_format(t, s) for t, s in zip(txts, styles))
 
     def process_tag(self, tag):
         """Process a tag."""
@@ -240,19 +283,25 @@ class HTMLParser():
         if tag.name == 'div':
             div_style = decode_style(tag.get('style', ''), _parse_div_style)
             if div_style.get('codeblock', False):
-                txt = f"\n```bash\n{txt}\n```"
+                txt = f"\n```bash\n{_clean_code_block(txt)}\n```"
         elif tag.name == 'span':
             if len(children) <= 1:
                 # if multiple children, their style overrides the parent
                 style.update(decode_style(tag.get('style', '')))
         elif tag.name == 'h1':
             txt = f"# {txt}"
+        elif tag.name == 'h2':
+            txt = f"## {txt}"
+        elif tag.name == 'h3':
+            txt = f"### {txt}"
+        elif tag.name == 'h4':
+            txt = f"#### {txt}"
         elif tag.name == 'a':
             txt, style = self._parse_link(tag, txt, style)
         elif tag.name == 'img':
             txt = _parse_img(tag)
         elif tag.name == 'font':
-            font = tag.get('face', "")
+            font = tag.get('face', "").strip("'")
             style['code'] = font in _MONOSPACE_FONTS or decode_style(
                 tag.get('style', ""), _parse_font_style)
             if font and font not in _MONOSPACE_FONTS:
@@ -264,7 +313,8 @@ class HTMLParser():
         elif tag.name == 'ul':
             txt = f"\n{txt}"
         elif tag.name == 'li':
-            txt = f"- {txt}\n"
+            mark = '- ' if tag.parent.name == 'ul' else '1. '
+            txt = f"{mark}{txt}\n"
         elif tag.name == 'u':
             style['underline'] = True
         elif tag.name in ('i', 'em'):
@@ -275,6 +325,12 @@ class HTMLParser():
             style['sup'] = True
         elif tag.name == 'sub':
             style['sub'] = True
+        elif tag.name == 'table':
+            txt = f'\n\n{txt}\n'
+        elif tag.name == 'tr':
+            txt = convert_tr(tag, txt)
+        elif tag.name in ('td', 'th'):
+            txt = f' {txt} |'
         elif tag.name == 'body':
             pass   # do noting more
         else:
@@ -303,7 +359,7 @@ def main():
     with open("hints.json", 'r') as fid:
         hints = json.load(fid)
 
-    links, external, converted = [os.path.split(args.path)], [], []
+    links, converted = [os.path.split(args.path)], []
     while links:
         path, fname = links.pop()
         logging.info(f"Converting {fname}")
@@ -318,15 +374,8 @@ def main():
         converted.append(fname)
 
         if args.recursive:
-            links += [(path, f) for _, f in curr_links
-                      if not f.startswith('evernote')]
-            external += [(lbl, f) for lbl, f in curr_links
-                         if f.startswith('evernote')]
+            links += [(path, f) for _, f in curr_links if f not in converted]
 
-    if external:
-        print("\nExternal links:")
-        for lbl, fname in external:
-            print(f"{lbl}: {fname}")
     if args.recursive:
         all_files = [f for f in os.listdir(path) if f.endswith('.html')]
         print("\nMissing files:")
