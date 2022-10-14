@@ -1,6 +1,7 @@
 """Converts Evernote HTML files to Markdown using Beautiful Soup."""
 import argparse
 import codecs
+import datetime
 import logging
 import json
 import os
@@ -14,8 +15,11 @@ from bs4 import BeautifulSoup, NavigableString
 
 _MONOSPACE_FONTS = ["Andale Mono", "Consolas", "Courier New", "Lucida Console",
                     "courier new, courier, monospace"]
+
+# options
 COLOR_INTERNAL_LINKS = True
-INLINE_PREVIEWS = True
+INLINE_PREVIEWS = 'link'        # 'no', 'link', 'image'
+IMAGE_MODE = 'html'
 
 
 def parse_span_style(tokens):
@@ -44,11 +48,18 @@ def _parse_img(tag):
     """Parse img tags."""
     name = tag.get('data-filename', "")[:-4] or tag.get('alt', "")
     name = quote(os.path.splitext(name)[0])
-    attr = [f" alt=\"{name}\"" if name else ""]
-    attr += [f" width={tag.get('width')}" if 'width' in tag.attrs else ""]
-    attr = ''.join(attr)
+    attr = {'src': tag.get('src'), 'alt': name,
+            'width': tag.get('width'), 'height': tag.get('height')}
 
-    return f"<img src=\"{tag.get('src')}\"{attr}>"
+    if IMAGE_MODE == 'html':        # Joplin does not support MD images
+        attr = ' '.join([f"{k}=\"{v}\"" for k, v in attr.items() if v])
+        return f"<img {attr}>"
+    elif IMAGE_MODE == 'markdown':  # for eg Obisidian
+        size = f"|{attr['width']}" if attr['width'] else ""
+        size += f"x{attr['height']}" if attr['height'] else ""
+        return f"![{attr['alt']}{size}]({attr['src']})"
+
+    raise ValueError("Unknown image mode: {IMAGE_MODE}")
 
 
 def _escape(string):
@@ -123,8 +134,14 @@ def _format(string, attr, warn=True):
         string = _clean_code_block(string)
         # no further formatting is possible
         return f"`{string}`" if string else ""
+    
+    # links in italics are normally definitions and use underline by default
+    #  but log the instances we found
+    if attr.get('link', None) and attr.get('italic', False):
+        if not attr.get('underline', False):
+            attr['underline'] = True
+            logging.debug("Link in italics without underline: %s", string)
 
-    or_str = string
     if attr.get('sup', False):
         string = f"<sup>{string}</sup>"
     if attr.get('sub', False):
@@ -138,11 +155,27 @@ def _format(string, attr, warn=True):
     if attr.get('bold', False):
         string = f"**{string}**"
     if attr.get('link', None):
-        if attr.get('italic', False) and not attr.get('underline', False):
-            logging.warning(f"Entry not underlined: {or_str}")
         string = f"[{string}]({attr['link']})"
 
     return string
+
+
+def _format_spans(spans):
+    """Format a list of spans."""
+    if len(spans) == 1:
+        return _format(*spans[0])
+
+    texts, styles = zip(*spans)
+    if all(s == styles[0] for s in styles):
+        return _format(''.join(texts), styles[0])
+
+    # factor out common styles to avoid markdown gotchas
+    styles = [set(s.items()) for s in styles]
+    base_style = styles[0].intersection(*styles[1:])
+    styles = [dict(s.difference(base_style)) for s in styles]
+
+    chunk = ''.join(_format(t, s) for t, s in zip(texts, styles))
+    return _format(chunk, dict(base_style))  # also apply base style
 
 
 def _replace_cr_except_code(txt, langs, cr_):
@@ -155,14 +188,35 @@ def _replace_cr_except_code(txt, langs, cr_):
     segs = [txt[s:e] for s, e in zip(steps[:-1], steps[1:])]
 
     for idx, seg in enumerate(segs):
-        if idx % 2 == 0:
+        if idx % 2 == 0:  # normal text
             segs[idx] = re.sub(r"(\S)\n([^\n-])", rf"\1{cr_}\n\2", seg)
-        elif langs:
+        elif langs:       # code block - keep \n and change language if needed
             lang = langs[idx // 2]
             if lang != "bash":
                 segs[idx] = re.sub("```bash", f"```{lang}", seg)
 
     return ''.join(segs)
+
+
+def print_metadata(meta):
+    """Print metadata as Joplin frontmatter."""
+    def _reformat_date(date):
+        """Reformat date."""
+        # add 'Z' because zero UTC offset not supported in Python
+        return datetime.datetime.strptime(date, '%m/%d/%Y %I:%M %p').strftime(
+            '%Y-%m-%d %H:%M:%S') + 'Z'
+
+    if 'created' in meta:
+        meta['created'] = _reformat_date(meta['created'])
+    if 'updated' in meta:
+        meta['updated'] = _reformat_date(meta['updated'])
+    if 'tags' in meta:
+        meta['tags'] = '\n' + '\n'.join([f"  - {t}" for t in meta['tags']])
+
+    keys_ordered = ('title', 'updated', 'created', 'source', 'author', 'tags')
+    txt = '\n'.join([f"{k}: {meta[k]}" for k in keys_ordered if k in meta])
+
+    return f"---\n{txt}\n---\n\n"
 
 
 def finalize(txt, hints, cr_="<br>"):
@@ -187,18 +241,42 @@ def finalize(txt, hints, cr_="<br>"):
 class HTMLParser():
     """Convert HTML to Markdown."""
 
-    def __init__(self, cr_=r"\\", hints=None):
+    def __init__(self, html, cr_=r"\\", hints=None):
         """Initialize parser for a single document."""
         self.cr_ = cr_
         self.hints = hints or {}
         self.internal_links = []
-
-    def parse(self, html):
-        """Convert HTML to Markdown."""
         with open(html, 'r', encoding='utf-8-sig') as fid:
-            soup = BeautifulSoup(fid, 'html.parser')
+            self.soup = BeautifulSoup(fid, 'html.parser')
+    
+    def parse_metadata(self, as_frontmatter=False):
+        """Extract metadata from note."""
+        meta = {}
+        tag = self.soup.find('h1')
+        if tag:
+            meta['title'] = tag.text
+            tag.extract()
+
+        table = self.soup.find('table')  # metadata table
+        if table:
+            tds = table.find_all('td')
+            for key, val in zip(tds[::2], tds[1::2]):  # iterate over pairs
+                key = key.text[:-1].strip().lower()
+                val = val.text.strip()
+                if key == 'tags':
+                    val = val.split(', ')
+
+                meta[key] = val
+            table.extract()
         
-        tag = next(soup.children)  # gwt HTML tag
+        if as_frontmatter:
+            return print_metadata(meta)
+
+        return meta
+
+    def parse(self):
+        """Convert HTML to Markdown."""
+        tag = next(self.soup.children)  # gwt HTML tag
         tag = next((el for el in tag.children if el.name == 'body'), None)
         if tag is None:
             raise ValueError("No content found")
@@ -239,32 +317,27 @@ class HTMLParser():
         style['link'] = link
         return txt, style
     
-    def _merge(self, children):
+    def _merge_tags(self, children):
         """Merge text from children."""
-        tag_name, txt, style, chunks, running = "", "", {}, [], False
+        txt, style, chunks, spans = "", {}, [], []
         for tag in children:
-            old_name, old_txt, old_style = tag_name, txt, style
+            old_txt, old_style = txt, style
             txt, style = self.process_tag(tag)
-            tag_name = tag.name
 
-            if tag_name == 'span':
+            if tag.name == 'span':
                 # delay adding spans to chunks and check for consecutive spans
-                running = True
-                if old_name == 'span':
-                    if style == old_style:
-                        txt = old_txt + txt
-                    else:
-                        chunks.append(_format(old_txt, old_style))
+                if spans and old_style == style:
+                    spans[-1][0] += txt   # merge with previous span
+                else:
+                    spans.append([txt, style])
+                if not tag.next_sibling or tag.next_sibling.name != 'span':
+                    chunks.append(_format_spans(spans))
+                    spans = []
                 continue
-            elif running and tag_name != 'span':
-                chunks.append(_format(old_txt, old_style))
-                running = False
-            if tag_name == 'div' and not old_txt.endswith('\n'):
+            if tag.name == 'div' and not old_txt.endswith('\n'):
                 txt = '\n' + txt
             chunks.append(_format(txt, style))
-        
-        if running:
-            chunks.append(_format(txt, style))
+
         return ''.join(chunks)
 
     def process_tag(self, tag):
@@ -274,7 +347,7 @@ class HTMLParser():
 
         style, txt, children = {}, tag.text, list(tag.children)
         if len(children) > 1:
-            txt = self._merge(children)
+            txt = self._merge_tags(children)
         elif len(children) == 1:
             txt, style = self.process_tag(children[0])
             if tag.name != 'span':  # stop here
@@ -338,10 +411,12 @@ class HTMLParser():
         return txt, style
 
 
-def convert_html_to_markdown(html, hints):
+def convert_html_to_markdown(html, hints, parse_metadata=True):
     """Convert HTML to Markdown."""
-    parser = HTMLParser(hints=hints)
-    txt = parser.parse(html)
+    parser = HTMLParser(html, hints=hints)
+    txt = parser.parse_metadata(as_frontmatter=True) \
+        if parse_metadata else ''
+    txt += parser.parse()
 
     return txt, parser.internal_links
 
