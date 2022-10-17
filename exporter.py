@@ -23,6 +23,7 @@ _WHITESPACE = tuple(whitespace) + (chr(160),)
 
 # options
 COLOR_INTERNAL_LINKS = True
+MD_DEFINITIONS = False          # Markdown-style definition lists
 INLINE_PREVIEWS = 'link'        # 'no', 'link', 'image'
 IMAGE_MODE = 'html'
 
@@ -102,28 +103,6 @@ def decode_style(prop, parser=parse_span_style):
     return parser(tokens)
 
 
-def convert_tr(el, text):
-    """Convert table rows; from Markdownify."""
-    cells = el.find_all(['td', 'th'])
-    is_headrow = all([cell.name == 'th' for cell in cells])
-    overline = ''
-    underline = ''
-    if is_headrow and not el.previous_sibling:
-        # first row and is headline: print headline underline
-        underline += '| ' + ' | '.join(['---'] * len(cells)) + ' |' + '\n'
-    elif (not el.previous_sibling
-            and (el.parent.name == 'table'
-                or (el.parent.name == 'tbody'
-                    and not el.parent.previous_sibling))):
-        # first row, not headline, and:
-        # - the parent is table or
-        # - the parent is tbody at the beginning of a table.
-        # print empty headline above this row
-        overline += '| ' + ' | '.join([''] * len(cells)) + ' |' + '\n'
-        overline += '| ' + ' | '.join(['---'] * len(cells)) + ' |' + '\n'
-    return overline + '|' + text + '\n' + underline
-
-
 def _clean_code_block(string):
     """Clean code blocks."""
     # spaces are non-breaking in code; remove leading/trailing spaces
@@ -156,11 +135,17 @@ def _format(string, attr, warn=True):
         string = _clean_code_block(string)
         if not string:
             return ""
+        
+        # avoid rendering errors when the code contains backticks
+        if string.startswith('`'):
+            string = ' ' + string
+        if string.endswith('`'):
+            string += ' '
 
         string = f"<code>{string}</code>" if attr['code'] == 'html' \
             else f"`{string}`"
 
-    if attr.get('color', "") == "rgb(0, 0, 0)":
+    if attr.get('color', "") in ("rgb(0, 0, 0)", "black"):
         attr.pop('color')  # remove default color
     if string and string[0] == '#' and re.match(r'#+ ', string):
         # move headings out of formatting
@@ -192,13 +177,13 @@ def _format(string, attr, warn=True):
         string = f"*{string}*"
     if attr.get('bold', False):
         string = f"**{string}**"
-    if attr.get('align', ''):
+    if attr.get('align', '') and attr['align'] in ('center', 'right'):
         string = string.replace('\n', '<br>')  # only BR works with divs
         string = f"<div align=\"{attr['align']}\">{string}</div>"
     if attr.get('link', None):
         string = f"[{string}]({attr['link']})"
     if attr.get('heading', 0):
-        string = f"{'#' * attr['heading']} {string}"
+        string = f"{'#' * attr['heading']} {string}\n\n"
 
     return head + string
 
@@ -236,7 +221,8 @@ def _replace_cr_except_code(txt, langs, cr_):
 
     for idx, seg in enumerate(segs):
         if idx % 2 == 0:  # normal text
-            segs[idx] = re.sub(r"(\S)\n([^\n-])", rf"\1{cr_}\n\2", seg)
+            # add single newlines but not for lists, tables and definitions
+            segs[idx] = re.sub(r"(\S)\n(?!\n| *[\|-|1|:])", rf"\1{cr_}\n", seg)
         elif langs:       # code block - keep \n and change language if needed
             lang = langs[idx // 2]
             if lang != "bash":
@@ -272,14 +258,14 @@ def finalize(txt, hints, cr_="<br>"):
     txt = txt.replace(chr(160), "&nbsp;")
     txt = txt.replace(codecs.BOM_UTF8.decode('utf-8'), "")
 
-    # remove multiple empty lines
-    txt = re.sub(r"\n\n\n+", "\n\n", txt)
-    # remove lone nbsp - needed before single cr conversion
-    txt = re.sub(r"\n\**(&nbsp;)+\**\n", "\n\n", txt)
-    # nbsp not at line start are spaces
-    txt = re.sub(r"&nbsp;(?![&nbsp;| |*]+)", " ", txt)
     # remove trailing spaces
     txt = re.sub(r" +\n", "\n", txt)
+    # remove lone nbsp - needed before single cr conversion
+    txt = re.sub(r"\n\**(&nbsp;)+\**\n", "\n\n", txt)
+    # remove multiple empty lines
+    txt = re.sub(r"\n\n\n+", "\n\n", txt)
+    # nbsp not at line start are spaces
+    txt = re.sub(r"&nbsp;(?![&nbsp;| |*]+)", " ", txt)
     txt = _replace_cr_except_code(txt, hints.get('codeblocks', []), cr_)
 
     return txt.strip() + '\n'
@@ -364,6 +350,64 @@ class HTMLParser():
         style['link'] = link
         return txt, style
     
+    def _parse_definition(self, tag, use_md=MD_DEFINITIONS):
+        """Format a definition."""
+        if use_md:
+            txt = ''
+            for i, child in tag.children:
+                if i == 0 and child.name != 'dt':
+                    # first definition tag, not suported in Markdown
+                    logging.warning(f"Invalid <dt> use.")
+                    return self._parse_definition(tag, use_md=False)
+                text = self._merge_tags(child.children)
+                txt += f"\n{text}\n" if child.name == 'dt' else f": {text}\n"
+            
+            return '\n' + txt
+        
+        tags = [f"<{t.name}>{self._merge_tags(t.children)}</{t.name}>"
+                for t in tag.children]
+        return f"<{tag.name}>{''.join(tags)}</{tag.name}>\n\n"
+    
+    def _parse_table(self, tag):
+        """Format a table."""
+        # first get all valid cells
+        cells = []
+        for tr in tag.children:  # if nested tags, skip colgroups
+            if isinstance(tr, NavigableString):
+                continue
+            if tr.name in ('thead', 'tbody', 'tfoot'):
+                cells += [[c for c in r.children if c.name in ('td', 'th')]
+                          for r in tr.children if r.name == 'tr']
+            elif tr.name == 'tr':
+                cells.append([c for c in tr.children if c.name in ('td', 'th')])
+        
+        if not cells:
+            return ''
+
+        n_cols = max(len(r) for r in cells)
+        table = [[None for _ in range(n_cols)] for _ in range(len(cells))]
+
+        for i, row in enumerate(cells):
+            col = 0
+            for cell in row:
+                while table[i][col] is not None:  # first empty cell
+                    col += 1
+                table[i][col] = self._merge_tags(
+                    cell.children).strip().replace('\n', '<br>')
+
+                if cell.get('colspan', 1) != 1:
+                    for j in range(1, int(cell['colspan'])):
+                        table[i][col + j] = ''
+                if cell.get('rowspan', 1) != 1:
+                    for j in range(1, int(cell['rowspan'])):
+                        table[i + j][col] = '^'
+
+        row_txts = ['|' + '|'.join(row) + '|' for row in table]
+        # an header separator is required for valid Markdown
+        row_txts.insert(1, '|' + '|'.join(['---' for _ in table[0]]) + '|')
+
+        return '\n' + '\n'.join(row_txts) + '\n\n'
+    
     def _merge_tags(self, children):
         """Merge text from children."""
         txt, style, chunks, spans = "", {}, [], []
@@ -393,12 +437,11 @@ class HTMLParser():
             return _escape(str(tag)), {}
 
         style, txt, children = {}, tag.text, list(tag.children)
-        if len(children) > 1:
-            txt = self._merge_tags(children)
-        elif len(children) == 1:
-            txt, style = self.process_tag(children[0])
-            # if tag.name != 'span':  # stop here
-            #     txt, style = _format(txt, style), {}
+        if tag.name not in ('table', 'tbody', 'dl'):  # skip custom tree tags
+            if len(children) > 1:
+                txt = self._merge_tags(children)
+            elif len(children) == 1:
+                txt, style = self.process_tag(children[0])
 
         if tag.name == 'div':
             div_style = decode_style(tag.get('style', ''), _parse_div_style)
@@ -411,7 +454,7 @@ class HTMLParser():
                 # if multiple children, their style overrides the parent
                 style.update(decode_style(tag.get('style', '')))
         elif tag.name == 'hr':  # horizontal rule
-            txt = f"\n----\n"
+            txt = f"\n----\n\n"
         elif tag.name.startswith('h'):  # heading
             style = decode_style(tag.get('style', ''), _parse_div_style)
             style['heading'] = int(tag.name[1])
@@ -429,13 +472,22 @@ class HTMLParser():
             txt = '> ' + txt.replace('\n', '\n> ')
         elif tag.name == 'p':
             txt = f"{txt}\n"
+            if tag.get('align', ''):
+                style['align'] = tag['align']
         elif tag.name == 'br':
             txt = '\n'
         elif tag.name in ('ul', 'ol'):
-            txt = f"\n{txt}"
+            parent = tag.parent
+            parent = parent.parent if parent.name == 'li' else parent
+            if parent.name == 'ul':  # nested list, pad with space
+                txt = '  ' + txt.replace('\n', '\n  ')
+            elif parent.name == 'ol':
+                txt = '   ' + txt.replace('\n', '\n   ')
+            txt = f"\n\n{txt}\n\n"
         elif tag.name == 'li':
-            mark = '- ' if tag.parent.name == 'ul' else '1. '
-            txt = f"{mark}{txt}\n"
+            if next(tag.children).name not in ('ul', 'ol'):
+                mark = '- ' if tag.parent.name == 'ul' else '1. '
+                txt = f"{mark}{txt}\n"
         elif tag.name == 'u':
             style['underline'] = True
         elif tag.name in ('del', 'strike', 's'):
@@ -458,12 +510,10 @@ class HTMLParser():
             style['align'] = 'center'
         elif tag.name == 'abbr':
             style['abbr'] = tag.get('title', ' ')
+        elif tag.name == 'dl':
+            txt = self._parse_definition(tag)
         elif tag.name in ('table', 'tbody'):
-            txt = f'\n\n{txt}\n'
-        elif tag.name == 'tr':
-            txt = convert_tr(tag, txt)
-        elif tag.name in ('td', 'th'):
-            txt = f' {txt} |'
+            txt = self._parse_table(tag)
         elif tag.name in ('body', 'cite', 'address'):
             pass   # ignore tags
         else:
@@ -480,6 +530,28 @@ def convert_html_to_markdown(html, hints, parse_metadata=True):
     txt += parser.parse()
 
     return txt, parser.internal_links
+
+
+def find_roots(converted):
+    """Find root nodes in the converted tree."""
+    try:
+        import networkx as nx
+    except ImportError:
+        logging.warning("NetworkX not installed, skipping root detection")
+        return []
+
+    net = nx.DiGraph()
+    for node, links in converted:
+        net.add_node(node)
+        for link in links:
+            if link in converted:  # ignore missing links
+                net.add_edge(node, link)
+    
+    islands = net.to_undirected().connected_components()
+
+    return [(next(island),
+             [node for node in island if not list(net.predecessors(node))])
+            for island in islands]
 
 
 def main():
@@ -501,7 +573,7 @@ def main():
     links = [(path, f) for f in all_files] \
         if args.mode == 'all' else [os.path.split(args.path)]
     
-    converted = []
+    converted = {}
     while links:
         path, fname = links.pop()
         logging.info(f"Converting {fname}")
@@ -513,7 +585,7 @@ def main():
         out_file = os.path.join(path, f"{out_name}.md")
         with open(out_file, 'w', encoding="utf-8") as fid:
             fid.write(txt)
-        converted.append(fname)
+        converted[fname] = curr_links
 
         if args.mode == 'recursive':
             links += [(path, f) for _, f in curr_links if f not in converted]
@@ -522,6 +594,17 @@ def main():
         print("\nMissing files:")
         for fname in set(all_files) - set(converted):
             print(f"{fname}")
+    elif args.mode == 'all':
+        roots_per_file = find_roots(converted)
+        if roots_per_file:
+            print("\n\nRoot files:")
+            for first, roots in roots_per_file:
+                if len(roots) > 1:
+                    print(f"{' '.join(roots)} (multiple roots)")
+                elif not roots:
+                    print(f"{first} (no root)")
+                else:
+                    print(f"{roots[0]}")
 
 
 if __name__ == '__main__':
