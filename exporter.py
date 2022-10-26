@@ -2,14 +2,16 @@
 import argparse
 import codecs
 import datetime
-import logging
 import json
+import logging
 import os
 import re
+import shutil
+import time
 from string import whitespace
 
 from itertools import chain
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from bs4 import BeautifulSoup, NavigableString
 
@@ -18,14 +20,18 @@ _MONOSPACE_FONTS = ["andale mono", "consolas", "courier new", "lucida console",
                     "monospace"]
 _KNOWN_FONTS = _MONOSPACE_FONTS + [
     "arial", "calibri", "tahoma", "times new roman", "lucida sans unicode",
-    "helvetica", "verdana", "windings"]
+    "helvetica", "verdana", "wingdings"]
 _WHITESPACE = tuple(whitespace) + (chr(160),)
 
+_ESCAPE_CHARS = "<>$*`-_"
+_ESCAPE_DICT = {c : rf'\{c}' for c in _ESCAPE_CHARS}
+
 # options
-COLOR_INTERNAL_LINKS = True
+COLOR_INTERNAL_LINKS = False
+USE_WIKILINKS = True            # use [[link|name]] instead of [name](link)
 MD_DEFINITIONS = False          # Markdown-style definition lists
 INLINE_PREVIEWS = 'link'        # 'no', 'link', 'image'
-IMAGE_MODE = 'html'
+IMAGE_MODE = 'markdown'         # 'html', 'markdown'
 
 
 def parse_span_style(tokens):
@@ -56,34 +62,17 @@ def _parse_div_style(tokens):
 def _parse_font_style(tokens):
     return {'code': "courier" in tokens.get('font-family', "").lower()}
 
-
-def _parse_img(tag):
-    """Parse img tags."""
-    name = tag.get('data-filename', "")[:-4] or tag.get('alt', "")
-    name = quote(os.path.splitext(name)[0])
-    attr = {'src': tag.get('src'), 'alt': name,
-            'width': tag.get('width'), 'height': tag.get('height')}
-
-    if IMAGE_MODE == 'html':        # Joplin does not support MD images
-        attr = ' '.join([f"{k}=\"{v}\"" for k, v in attr.items() if v])
-        return f"<img {attr}>"
-    elif IMAGE_MODE == 'markdown':  # for eg Obisidian
-        size = f"|{attr['width']}" if attr['width'] else ""
-        size += f"x{attr['height']}" if attr['height'] else ""
-        return f"![{attr['alt']}{size}]({attr['src']})"
-
-    raise ValueError("Unknown image mode: {IMAGE_MODE}")
-
-
 def _escape(string):
     """Escape reserved Markdown characters."""
-    string = string.replace("<", r"\<").replace(">", r"\>").replace("$", r"\$")
-    return string.replace("*", r"\*").replace("`", r"\`")
+    for char, esc in _ESCAPE_DICT.items():
+        string = string.replace(char, esc)
+    return string
 
 def _unescape(string):
     """Unescape reserved Markdown characters for codeblocks."""
-    string = string.replace(r"\>", ">").replace(r"\<", "<").replace(r"\$", "$")
-    return string.replace(r"\*", "*").replace(r"\`", "`")
+    for char, esc in _ESCAPE_DICT.items():
+        string = string.replace(esc, char)
+    return string
 
 
 def decode_style(prop, parser=parse_span_style):
@@ -117,7 +106,7 @@ def _clean_code_block(string):
 
 def _format(string, attr, warn=True):
     """Add formats to string; beware of the order."""
-    if not attr or string.isspace():
+    if not attr or not string or not string.strip(''.join(_WHITESPACE)):
         return string
 
     if string.endswith(_WHITESPACE) or string.startswith(_WHITESPACE):
@@ -128,7 +117,7 @@ def _format(string, attr, warn=True):
     
     if attr.get('codeblock', False):
         lang = attr.get('lang', 'bash')
-        return f"\n```{lang}\n{_clean_code_block(string)}\n```"
+        return f"\n\n```{lang}\n{_clean_code_block(string)}\n```\n\n"
 
     if attr.get('code', ''):
         # spaces are non-breaking in code; remove leading/trailing spaces
@@ -136,14 +125,17 @@ def _format(string, attr, warn=True):
         if not string:
             return ""
         
-        # avoid rendering errors when the code contains backticks
-        if string.startswith('`'):
-            string = ' ' + string
-        if string.endswith('`'):
-            string += ' '
-
-        string = f"<code>{string}</code>" if attr['code'] == 'html' \
-            else f"`{string}`"
+        if attr['code'] == 'html':
+            string = f"<code>{string}</code>"
+        elif '`' in string:
+            # avoid rendering errors when the code contains backticks
+            if string.startswith('`'):
+                string = ' ' + string
+            if string.endswith('`'):
+                string += ' '
+            string = f"``{string}``"
+        else:
+            string = f"`{string}`"
 
     if attr.get('color', "") in ("rgb(0, 0, 0)", "black"):
         attr.pop('color')  # remove default color
@@ -181,9 +173,15 @@ def _format(string, attr, warn=True):
         string = string.replace('\n', '<br>')  # only BR works with divs
         string = f"<div align=\"{attr['align']}\">{string}</div>"
     if attr.get('link', None):
-        string = f"[{string}]({attr['link']})"
+        # wikilink only for internal non-formatted links
+        if USE_WIKILINKS and attr['link'].endswith('.md') and \
+                all(c not in string for c in '/<*~`'):
+            lnk = unquote(attr['link'][:-3])
+            string = f"[[{lnk}]]" if lnk == string else f"[[{lnk}|{string}]]"
+        else:
+            string = f"[{string}]({attr['link']})"
     if attr.get('heading', 0):
-        string = f"{'#' * attr['heading']} {string}\n\n"
+        string = f"\n\n{'#' * attr['heading']} {string}\n\n"
 
     return head + string
 
@@ -210,11 +208,9 @@ def _format_spans(spans):
     return _format(chunk, base_style)  # also apply base style
 
 
-def _replace_cr_except_code(txt, langs, cr_):
+def _replace_cr_except_code(txt, cr_):
     """Replace single newlines except for bullet lists and code blocks."""
     codeblocks = list(re.finditer(r"```bash([\S|\s]+?)```", txt))
-    if langs and len(codeblocks) != len(langs):
-        raise ValueError("Wrong number of code block hints.")
 
     steps = [0] + list(chain(*[c.span() for c in codeblocks])) + [len(txt)]
     segs = [txt[s:e] for s, e in zip(steps[:-1], steps[1:])]
@@ -222,11 +218,8 @@ def _replace_cr_except_code(txt, langs, cr_):
     for idx, seg in enumerate(segs):
         if idx % 2 == 0:  # normal text
             # add single newlines but not for lists, tables and definitions
-            segs[idx] = re.sub(r"(\S)\n(?!\n| *[\|-|1|:])", rf"\1{cr_}\n", seg)
-        elif langs:       # code block - keep \n and change language if needed
-            lang = langs[idx // 2]
-            if lang != "bash":
-                segs[idx] = re.sub("```bash", f"```{lang}", seg)
+            segs[idx] = re.sub(r"(\S)\n(?!\n| *[\|\-|1|:])",
+                               rf"\1{cr_}\n", seg)
 
     return ''.join(segs)
 
@@ -252,21 +245,24 @@ def print_metadata(meta):
     return f"---\n{txt}\n---\n\n"
 
 
-def finalize(txt, hints, cr_="<br>"):
+def finalize(txt, cr_="<br>"):
     """Clean up residual formatting."""
     # fix special characters
-    txt = txt.replace(chr(160), "&nbsp;")
+    txt = txt.replace(chr(160), "&nbsp;").replace('\t', '    ')
     txt = txt.replace(codecs.BOM_UTF8.decode('utf-8'), "")
 
+    # nbsp not at line start are spaces
+    txt = re.sub(r"&nbsp;(?![&nbsp;| ]+)", " ", txt)
     # remove trailing spaces
     txt = re.sub(r" +\n", "\n", txt)
     # remove lone nbsp - needed before single cr conversion
     txt = re.sub(r"\n\**(&nbsp;)+\**\n", "\n\n", txt)
     # remove multiple empty lines
     txt = re.sub(r"\n\n\n+", "\n\n", txt)
-    # nbsp not at line start are spaces
-    txt = re.sub(r"&nbsp;(?![&nbsp;| |*]+)", " ", txt)
-    txt = _replace_cr_except_code(txt, hints.get('codeblocks', []), cr_)
+    # space before first nbsp in line to create Markdown blocks
+    txt = re.sub(r"\n(&nbsp;)", r"\n \1", txt)
+
+    txt = _replace_cr_except_code(txt, cr_)
 
     return txt.strip() + '\n'
 
@@ -274,11 +270,11 @@ def finalize(txt, hints, cr_="<br>"):
 class HTMLParser():
     """Convert HTML to Markdown."""
 
-    def __init__(self, html, cr_=r"\\", hints=None):
+    def __init__(self, html, cr_=r"\\"):
         """Initialize parser for a single document."""
         self.cr_ = cr_
-        self.hints = hints or {}
-        self.internal_links = []
+        self.path = ''
+        self.internal_links, self.resources = [], []
         with open(html, 'r', encoding='utf-8-sig') as fid:
             self.soup = BeautifulSoup(fid, 'html.parser')
     
@@ -301,6 +297,14 @@ class HTMLParser():
 
                 meta[key] = val
             table.extract()
+
+        # notebook path as a special tag starting with 'nb:'
+        if meta.get('tags', None):
+            for tag in meta['tags']:
+                if tag.startswith('nb:'):
+                    self.path = os.path.normpath(tag[3:])
+                    meta['tags'].remove(tag)
+                    break
         
         if as_frontmatter:
             return print_metadata(meta)
@@ -315,40 +319,68 @@ class HTMLParser():
             raise ValueError("No content found")
 
         txt, _ = self.process_tag(tag)
-        return finalize(txt, self.hints, self.cr_)
+        return finalize(txt, self.cr_)
 
     def _parse_link(self, tag, txt, style):
         """Format a link."""
-        link, name = tag.get('href', ''), tag.get('name', '')
-        if name:  # anchor, drop it
+        link = tag.get('href', '')
+        if not link:  # anchor, drop it
             return tag.text, {}
 
-        if not link or link == "https:":  # anchor or empty link
+        if link == "https:":
             logging.warning(f"Empty link found for {txt}")
             return tag.text, {}
         if link == tag.text:
-            return tag.text, {}  # use autolink
+            return tag.text, style  # use autolink
+        if link.startswith('#'):  # internal anchor
+            return txt, style
 
         style = decode_style(tag.get('style', ''))
         inter = style.get('color', False) in ("rgb(105, 170, 53)", "#69aa35")
 
-        if '://' not in link:  # internal link
+        if ':' not in link:  # internal link
             if link.endswith('.html'):
-                self.internal_links.append((tag.text, link))
+                self.internal_links.append(link)
                 link = link.replace(".html", ".md")
-            elif link.endswith(('.mp4', '.pdf')) and INLINE_PREVIEWS:
-                # discard preview image and link file directly
-                txt = os.path.basename(link)
+            else:
+                self.resources.append(link)
+                if link.endswith(('.mp4', '.pdf')) and INLINE_PREVIEWS:
+                    # discard preview image and link file directly
+                    txt = os.path.basename(link)
 
             if not COLOR_INTERNAL_LINKS and inter:
                 # remove color for internal links
                 style.pop('color')
-            link = quote(link)
+            link = quote(link.replace('\\', '/'))
         elif inter:
             logging.warning(f"Unresolved internal link: {txt} {link}")
 
         style['link'] = link
         return txt, style
+    
+    def _parse_img(self, tag):
+        """Parse img tags."""
+        src = tag.get('src', '')
+        if '://' in src:
+            logging.warning(f"External image found: {tag['src']}")
+        else:
+            self.resources.append(src)
+            src = quote(src.replace('\\', '/'))
+
+        name = tag.get('data-filename', "")[:-4] or tag.get('alt', "")
+        name = os.path.basename(src) if not name else name
+        attr = {'src': src, 'alt': os.path.splitext(name)[0],
+                'width': tag.get('width'), 'height': tag.get('height')}
+
+        if IMAGE_MODE == 'html':        # Joplin does not support MD images
+            attr = ' '.join([f"{k}=\"{v}\"" for k, v in attr.items() if v])
+            return f"<img {attr}>"
+        elif IMAGE_MODE == 'markdown':  # for eg Obisidian
+            size = f"|{attr['width']}" if attr['width'] else ""
+            size += f"x{attr['height']}" if attr['height'] else ""
+            return f"![{attr['alt']}{size}]({attr['src']})"
+
+        raise ValueError("Unknown image mode: {IMAGE_MODE}")
     
     def _parse_definition(self, tag, use_md=MD_DEFINITIONS):
         """Format a definition."""
@@ -370,6 +402,10 @@ class HTMLParser():
     
     def _parse_table(self, tag):
         """Format a table."""
+        def _parse_cell(tag):
+            """Format a table cell."""
+            return self._merge_tags(tag.children).strip()
+
         # first get all valid cells
         cells = []
         for tr in tag.children:  # if nested tags, skip colgroups
@@ -383,17 +419,19 @@ class HTMLParser():
         
         if not cells:
             return ''
+        if len(cells) ==1 and len(cells[0]) == 1:
+            # single cell, skip table
+            return '\n' + _parse_cell(cells[0][0]) + '\n\n'
 
-        n_cols = max(len(r) for r in cells)
+        n_cols = sum(int(c.get('colspan', 1)) for c in cells[0])
         table = [[None for _ in range(n_cols)] for _ in range(len(cells))]
 
         for i, row in enumerate(cells):
             col = 0
             for cell in row:
-                while table[i][col] is not None:  # first empty cell
+                while table[i][col] is not None:  # first non-empty cell
                     col += 1
-                table[i][col] = self._merge_tags(
-                    cell.children).strip().replace('\n', '<br>')
+                table[i][col] = _parse_cell(cell).replace('\n', '<br>')
 
                 if cell.get('colspan', 1) != 1:
                     for j in range(1, int(cell['colspan'])):
@@ -427,6 +465,10 @@ class HTMLParser():
                 continue
             if tag.name == 'div' and not old_txt.endswith('\n'):
                 txt = '\n' + txt
+            if not tag.name and 'code' not in style:
+                txt = txt.replace('\n', ' ')  # no newlines in HTML text
+                if tag.parent.name in ('ul', 'ol'):
+                    txt = txt.strip()   # avoid spaces messing up lists
             chunks.append(_format(txt, style))
 
         return ''.join(chunks)
@@ -437,7 +479,7 @@ class HTMLParser():
             return _escape(str(tag)), {}
 
         style, txt, children = {}, tag.text, list(tag.children)
-        if tag.name not in ('table', 'tbody', 'dl'):  # skip custom tree tags
+        if tag.name not in ('table', 'dl'):  # skip custom tree tags
             if len(children) > 1:
                 txt = self._merge_tags(children)
             elif len(children) == 1:
@@ -461,7 +503,7 @@ class HTMLParser():
         elif tag.name == 'a':
             txt, style = self._parse_link(tag, txt, style)
         elif tag.name == 'img':
-            txt = _parse_img(tag)
+            txt =self._parse_img(tag)
         elif tag.name == 'font':
             font = tag.get('face', "").split(',')[0].strip("'").lower()
             style['code'] = font in _MONOSPACE_FONTS or decode_style(
@@ -469,7 +511,7 @@ class HTMLParser():
             if font and font not in _KNOWN_FONTS:
                 logging.warning(f"Unknown font: {font}")
         elif tag.name == 'blockquote':
-            txt = '> ' + txt.replace('\n', '\n> ')
+            txt = '\n\n> ' + txt.strip() + '\n\n'
         elif tag.name == 'p':
             txt = f"{txt}\n"
             if tag.get('align', ''):
@@ -487,7 +529,7 @@ class HTMLParser():
         elif tag.name == 'li':
             if next(tag.children).name not in ('ul', 'ol'):
                 mark = '- ' if tag.parent.name == 'ul' else '1. '
-                txt = f"{mark}{txt}\n"
+                txt = f"{mark}{txt.strip()}\n"
         elif tag.name == 'u':
             style['underline'] = True
         elif tag.name in ('del', 'strike', 's'):
@@ -522,14 +564,43 @@ class HTMLParser():
         return txt, style
 
 
-def convert_html_to_markdown(html, hints, parse_metadata=True):
+def convert_html_to_markdown(html, parse_metadata=True):
     """Convert HTML to Markdown."""
-    parser = HTMLParser(html, hints=hints)
+    parser = HTMLParser(html)
     txt = parser.parse_metadata(as_frontmatter=True) \
         if parse_metadata else ''
     txt += parser.parse()
 
-    return txt, parser.internal_links
+    return txt, parser
+
+
+def _convert_file(path, fname, out_dir='', is_test=False):
+    """Convert a single file and copy its resource files."""
+    logging.info(f"Converting {fname}")
+
+    out_name, _ = os.path.splitext(fname)
+    txt, parser = convert_html_to_markdown(
+        os.path.join(path, fname))
+
+    if not is_test:
+        if out_dir:
+            out_path = os.path.join(out_dir, parser.path)
+            os.makedirs(out_path, exist_ok=True)
+        else:
+            out_path = path
+
+        out_file = os.path.join(out_path, f"{out_name}.md")
+        with open(out_file, 'w', encoding="utf-8") as fid:
+            fid.write(txt)
+
+        if out_dir and parser.resources:
+            res_path = os.path.join(out_dir, 'resources')
+            for res in parser.resources:
+                out_path = os.path.join(res_path, res)
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                shutil.copyfile(os.path.join(path, res), out_path)
+    
+    return parser.internal_links
 
 
 def find_roots(converted):
@@ -541,17 +612,16 @@ def find_roots(converted):
         return []
 
     net = nx.DiGraph()
-    for node, links in converted:
+    for node, links in converted.items():
         net.add_node(node)
         for link in links:
             if link in converted:  # ignore missing links
                 net.add_edge(node, link)
-    
-    islands = net.to_undirected().connected_components()
 
-    return [(next(island),
+    return [(next(iter(island)),
              [node for node in island if not list(net.predecessors(node))])
-            for island in islands]
+            for island in nx.weakly_connected_components(net)
+            if len(island) > 1]
 
 
 def main():
@@ -562,10 +632,20 @@ def main():
     parser.add_argument("path", type=str, help="file to convert")
     parser.add_argument("-m", "--mode", default="single",
                         help="recursively convert all files following links.")
+    parser.add_argument("-o", "--output", default="", help="output directory"
+                        "for converted files (default: in-place)")
+    parser.add_argument("-v", "--verbose", type=int, default=0,
+                        help="verbosity level (0-2)")
+    parser.add_argument("-t", "--test", action="store_true",
+                        help="test mode, don't write files")
+
     args = parser.parse_args()
 
-    with open("hints.json", 'r') as fid:
-        hints = json.load(fid)
+    if args.verbose >= 2:
+        logging.basicConfig(level=logging.DEBUG)
+    elif args.verbose == 1:
+        logging.basicConfig(level=logging.INFO)
+
 
     path = os.path.dirname(args.path)
     all_files = sorted(f for f in os.listdir(path) if f.endswith('.html'))
@@ -574,39 +654,38 @@ def main():
         if args.mode == 'all' else [os.path.split(args.path)]
     
     converted = {}
+    start = time.time()
     while links:
         path, fname = links.pop()
-        logging.info(f"Converting {fname}")
-
-        out_name, _ = os.path.splitext(fname)
-        txt, curr_links = convert_html_to_markdown(
-            os.path.join(path, fname), hints['files'].get(fname, {}))
-
-        out_file = os.path.join(path, f"{out_name}.md")
-        with open(out_file, 'w', encoding="utf-8") as fid:
-            fid.write(txt)
-        converted[fname] = curr_links
+        internal_links = _convert_file(path, fname, args.output, args.test)
+        converted[fname] = internal_links
 
         if args.mode == 'recursive':
-            links += [(path, f) for _, f in curr_links if f not in converted]
+            links += [(path, f) for f in internal_links if f not in converted]
 
     if args.mode == 'recursive':
         print("\nMissing files:")
         for fname in set(all_files) - set(converted):
             print(f"{fname}")
     elif args.mode == 'all':
+        print("\nMissing links:\n--------------")
+        links = [set(l) for l in converted.values()]
+        for fname in links[0].union(*links[1:]) - set(converted):
+            print(f"{fname}")
+
         roots_per_file = find_roots(converted)
-        if roots_per_file:
-            print("\n\nRoot files:")
-            for first, roots in roots_per_file:
-                if len(roots) > 1:
-                    print(f"{' '.join(roots)} (multiple roots)")
-                elif not roots:
-                    print(f"{first} (no root)")
-                else:
-                    print(f"{roots[0]}")
+        print("\nRoot files:\n-----------")
+        for first, roots in roots_per_file:
+            if len(roots) > 1:
+                print(f"{' '.join(roots)} (multiple roots)")
+            elif not roots:
+                print(f"{first} (no root)")
+            else:
+                print(f"{roots[0]}")
+    
+    elapsed = time.time() - start
+    print(f"Converted {len(list(converted))} files in {elapsed:.3f} seconds.")
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
     main()

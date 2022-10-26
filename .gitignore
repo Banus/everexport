@@ -1,3 +1,13 @@
+# environment
+.vscode
+__pycache__
+
+# export tests
+ever/
+md/
+
+# local test files
 *.md
 *.htm*
-.vscode
+
+*.log
