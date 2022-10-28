@@ -2,7 +2,6 @@
 import argparse
 import codecs
 import datetime
-import json
 import logging
 import os
 import re
@@ -21,17 +20,19 @@ _MONOSPACE_FONTS = ["andale mono", "consolas", "courier new", "lucida console",
 _KNOWN_FONTS = _MONOSPACE_FONTS + [
     "arial", "calibri", "tahoma", "times new roman", "lucida sans unicode",
     "helvetica", "verdana", "wingdings"]
-_WHITESPACE = tuple(whitespace) + (chr(160),)
+_EMBEDDED_FILES = ('mp4', 'pdf')
 
-_ESCAPE_CHARS = "<>$*`-_"
-_ESCAPE_DICT = {c : rf'\{c}' for c in _ESCAPE_CHARS}
+_WHITESPACE = ''.join(tuple(whitespace) + (chr(160),))
+
+_ESCAPE_CHARS = "<>$*`+-_~#["
+_ESCAPE_DICT = {**{c : rf'\{c}' for c in _ESCAPE_CHARS}, **{']]': r']\]'}}
 
 # options
 COLOR_INTERNAL_LINKS = False
 USE_WIKILINKS = True            # use [[link|name]] instead of [name](link)
 MD_DEFINITIONS = False          # Markdown-style definition lists
 INLINE_PREVIEWS = 'link'        # 'no', 'link', 'image'
-IMAGE_MODE = 'markdown'         # 'html', 'markdown'
+IMAGE_MODE = 'wiki'             # 'html', 'markdown', 'wiki'
 
 
 def parse_span_style(tokens):
@@ -46,6 +47,7 @@ def parse_span_style(tokens):
     style['sup'] = tokens.get('vertical-align', None) == 'super'
     style['code'] = "courier" in tokens.get('font-family', "").lower()
     style['color'] = tokens.get('color', False)
+    style['highlight'] = tokens.get('background-color', False)
 
     return {k: v for k, v in style.items() if v}  # drop useless attributes
 
@@ -73,6 +75,11 @@ def _unescape(string):
     for char, esc in _ESCAPE_DICT.items():
         string = string.replace(esc, char)
     return string
+
+def _quote(string):
+    """Quote a URL string."""
+    string = string.replace('\\', '/').replace(chr(160), " ")
+    return quote(string, safe='/:,&+') if unquote(string) == string else string
 
 
 def decode_style(prop, parser=parse_span_style):
@@ -104,14 +111,70 @@ def _clean_code_block(string):
     return string
 
 
+def _format_link(link, string):
+    """Format a link, optionally as a wikilink."""
+    # no need to escape in links, but nbsp are not correctly rendered
+    string = _unescape(string).replace(chr(160), ' ')
+    # fix square brackets in link messing up formatting
+    if string.endswith(']'):
+        string += ' '
+    is_wikilink = USE_WIKILINKS and link.endswith('.md') and not ':' in link
+
+    # wikilink only for internal non-formatted links
+    if is_wikilink and all(c not in string for c in '/<*~`=|[]'):
+        # sometimes URLs are already encoded, recover them and remove nbsp
+        lnk = unquote(link[:-3], 'Windows-1252').replace(chr(160), ' ')
+        # trailing spaces are meaningless in wikilinks, use full links
+        if not lnk.endswith(' '):
+            return f"[[{lnk}]]" if lnk == string else f"[[{lnk}|{string}]]"
+
+    return f"[{string}]({_quote(link)})"
+
+def _apply_style(string, attr):
+    """Apply Markdown formatting to text."""
+    # links in italics are normally definitions and use underline by default
+    #  but log the instances we found
+    if attr.get('link', None) and attr.get('italic', False):
+        if not attr.get('underline', False):
+            attr['underline'] = True
+            logging.debug("Link in italics without underline: %s", string)
+
+    if attr.get('link', None):
+        string = _format_link(attr['link'], string)
+    if attr.get('italic', False):
+        string = f"*{string}*"
+    if attr.get('bold', False):
+        string = f"**{string}**"
+    if attr.get('strikethrough', False):
+        string = f"~~{string}~~"
+    if attr.get('highlight', False):
+        string = f"=={string}=="
+    if attr.get('abbr', None):
+        string = f"<abbr title=\"{attr['abbr']}\">{string}</abbr>"
+    if attr.get('sup', False):
+        string = f"<sup>{string}</sup>"
+    if attr.get('sub', False):
+        string = f"<sub>{string}</sub>"
+    if attr.get('underline', False):
+        string = f"<u>{string}</u>"
+    if attr.get('color', False):
+        string = f"<span style=\"color: {attr['color']}\">{string}</span>"
+    if attr.get('align', '') and attr['align'] in ('center', 'right'):
+        string = string.replace('\n', '<br>')  # only BR works with divs
+        string = f"<div align=\"{attr['align']}\">{string}</div>"
+
+    return string
+
+
 def _format(string, attr, warn=True):
     """Add formats to string; beware of the order."""
-    if not attr or not string or not string.strip(''.join(_WHITESPACE)):
+    if not attr or not string.strip(_WHITESPACE):
         return string
 
-    if string.endswith(_WHITESPACE) or string.startswith(_WHITESPACE):
+    if string.endswith(tuple(_WHITESPACE)) \
+            or string.startswith(tuple(_WHITESPACE)):
         # remove formatting from leading/trailing whitespace to avoid MD errors
-        clean = string.strip(''.join(_WHITESPACE))
+        clean = string.strip(_WHITESPACE)
         off, size = string.find(clean[0]), len(clean)
         return string[:off] + _format(clean, attr, warn) + string[off+size:]
     
@@ -137,7 +200,7 @@ def _format(string, attr, warn=True):
         else:
             string = f"`{string}`"
 
-    if attr.get('color', "") in ("rgb(0, 0, 0)", "black"):
+    if attr.get('color', "") in ("rgb(0, 0, 0)", "black", "#000000"):
         attr.pop('color')  # remove default color
     if string and string[0] == '#' and re.match(r'#+ ', string):
         # move headings out of formatting
@@ -146,44 +209,7 @@ def _format(string, attr, warn=True):
     else:
         head = ""
 
-    # links in italics are normally definitions and use underline by default
-    #  but log the instances we found
-    if attr.get('link', None) and attr.get('italic', False):
-        if not attr.get('underline', False):
-            attr['underline'] = True
-            logging.debug("Link in italics without underline: %s", string)
-
-    if attr.get('abbr', None):
-        string = f"<abbr title=\"{attr['abbr']}\">{string}</abbr>"
-    if attr.get('sup', False):
-        string = f"<sup>{string}</sup>"
-    if attr.get('sub', False):
-        string = f"<sub>{string}</sub>"
-    if attr.get('underline', False):
-        string = f"<u>{string}</u>"
-    if attr.get('strikethrough', False):
-        string = f"~~{string}~~"
-    if attr.get('color', False):
-        string = f"<span style=\"color: {attr['color']}\">{string}</span>"
-    if attr.get('italic', False):
-        string = f"*{string}*"
-    if attr.get('bold', False):
-        string = f"**{string}**"
-    if attr.get('align', '') and attr['align'] in ('center', 'right'):
-        string = string.replace('\n', '<br>')  # only BR works with divs
-        string = f"<div align=\"{attr['align']}\">{string}</div>"
-    if attr.get('link', None):
-        # wikilink only for internal non-formatted links
-        if USE_WIKILINKS and attr['link'].endswith('.md') and \
-                all(c not in string for c in '/<*~`'):
-            lnk = unquote(attr['link'][:-3])
-            string = f"[[{lnk}]]" if lnk == string else f"[[{lnk}|{string}]]"
-        else:
-            string = f"[{string}]({attr['link']})"
-    if attr.get('heading', 0):
-        string = f"\n\n{'#' * attr['heading']} {string}\n\n"
-
-    return head + string
+    return head + _apply_style(string, attr)
 
 
 def _format_spans(spans):
@@ -217,9 +243,12 @@ def _replace_cr_except_code(txt, cr_):
 
     for idx, seg in enumerate(segs):
         if idx % 2 == 0:  # normal text
+            # escape combinations mimiking a numbered list
+            seg = re.sub(r'(\d)([\.\)]) ', r'\g<1>\\\g<2> ', seg)
             # add single newlines but not for lists, tables and definitions
-            segs[idx] = re.sub(r"(\S)\n(?!\n| *[\|\-|1|:])",
-                               rf"\1{cr_}\n", seg)
+            seg = re.sub(r"(\S)\n(?!\n| *[\|\-|1|:|>])", rf"\1 {cr_}\n", seg)
+
+            segs[idx] = seg
 
     return ''.join(segs)
 
@@ -232,17 +261,26 @@ def print_metadata(meta):
         return datetime.datetime.strptime(date, '%m/%d/%Y %I:%M %p').strftime(
             '%Y-%m-%d %H:%M:%S') + 'Z'
 
+    if meta.get('tags', []):
+        tags = [tag.replace(' ', '_') for tag in meta['tags']]
+        meta['tags'] = '\n' + '\n'.join([f"  - {tag}" for tag in tags])
+
+    # fall back to created date if no updated date is available
+    updated = meta.get('updated', meta.get('created', ''))
+    if updated:
+        meta['updated'] = _reformat_date(updated)
     if 'created' in meta:
         meta['created'] = _reformat_date(meta['created'])
-    if 'updated' in meta:
-        meta['updated'] = _reformat_date(meta['updated'])
-    if 'tags' in meta:
-        meta['tags'] = '\n' + '\n'.join([f"  - {t}" for t in meta['tags']])
 
-    keys_ordered = ('title', 'updated', 'created', 'source', 'author', 'tags')
+    title = meta.get('title', '')
+    if title and ':' in title:  # wrap title in quotes if it contains a colon
+        meta['title'] = f'"{title}"' if '"' not in title else f"'{title}'"
+
+    keys_ordered = ('title', 'updated', 'created', 'source', 'location',
+                    'author', 'tags')
     txt = '\n'.join([f"{k}: {meta[k]}" for k in keys_ordered if k in meta])
 
-    return f"---\n{txt}\n---\n\n"
+    return f"---\n{txt}\n---\n"
 
 
 def finalize(txt, cr_="<br>"):
@@ -262,7 +300,7 @@ def finalize(txt, cr_="<br>"):
     # space before first nbsp in line to create Markdown blocks
     txt = re.sub(r"\n(&nbsp;)", r"\n \1", txt)
 
-    txt = _replace_cr_except_code(txt, cr_)
+    txt = _replace_cr_except_code(txt.strip(), cr_) + '\n'
 
     return txt.strip() + '\n'
 
@@ -273,17 +311,16 @@ class HTMLParser():
     def __init__(self, html, cr_=r"\\"):
         """Initialize parser for a single document."""
         self.cr_ = cr_
-        self.path = ''
+        self.path, self.meta = '', {}
         self.internal_links, self.resources = [], []
         with open(html, 'r', encoding='utf-8-sig') as fid:
             self.soup = BeautifulSoup(fid, 'html.parser')
     
     def parse_metadata(self, as_frontmatter=False):
         """Extract metadata from note."""
-        meta = {}
         tag = self.soup.find('h1')
         if tag:
-            meta['title'] = tag.text
+            self.meta['title'] = tag.text
             tag.extract()
 
         table = self.soup.find('table')  # metadata table
@@ -295,21 +332,23 @@ class HTMLParser():
                 if key == 'tags':
                     val = val.split(', ')
 
-                meta[key] = val
+                self.meta[key] = val
             table.extract()
 
         # notebook path as a special tag starting with 'nb:'
-        if meta.get('tags', None):
-            for tag in meta['tags']:
+        if self.meta.get('tags', None):
+            for tag in self.meta['tags']:
                 if tag.startswith('nb:'):
                     self.path = os.path.normpath(tag[3:])
-                    meta['tags'].remove(tag)
+                    self.meta['tags'].remove(tag)
+                    if not self.meta['tags']:
+                        del self.meta['tags']
                     break
         
         if as_frontmatter:
-            return print_metadata(meta)
+            return print_metadata(self.meta)
 
-        return meta
+        return self.meta
 
     def parse(self):
         """Convert HTML to Markdown."""
@@ -323,19 +362,19 @@ class HTMLParser():
 
     def _parse_link(self, tag, txt, style):
         """Format a link."""
-        link = tag.get('href', '')
+        link, is_inline = tag.get('href', ''), False
         if not link:  # anchor, drop it
-            return tag.text, {}
+            return txt, style
 
         if link == "https:":
-            logging.warning(f"Empty link found for {txt}")
-            return tag.text, {}
-        if link == tag.text:
-            return tag.text, style  # use autolink
+            logging.warning(f"Empty link found for {tag.text}")
+            return txt, style
+        if link == txt:
+            return txt, style  # use autolink
         if link.startswith('#'):  # internal anchor
             return txt, style
 
-        style = decode_style(tag.get('style', ''))
+        style.update(decode_style(tag.get('style', '')))
         inter = style.get('color', False) in ("rgb(105, 170, 53)", "#69aa35")
 
         if ':' not in link:  # internal link
@@ -344,28 +383,36 @@ class HTMLParser():
                 link = link.replace(".html", ".md")
             else:
                 self.resources.append(link)
-                if link.endswith(('.mp4', '.pdf')) and INLINE_PREVIEWS:
-                    # discard preview image and link file directly
-                    txt = os.path.basename(link)
+                if link.endswith(_EMBEDDED_FILES) and INLINE_PREVIEWS:
+                    is_inline = True
 
             if not COLOR_INTERNAL_LINKS and inter:
                 # remove color for internal links
                 style.pop('color')
-            link = quote(link.replace('\\', '/'))
         elif inter:
             logging.warning(f"Unresolved internal link: {txt} {link}")
 
-        style['link'] = link
+        if is_inline:  # discard preview image and link file directly
+            txt = f"![{os.path.basename(tag.get('href'))}]({_quote(link)})"
+        else:
+            style['link'] = link
+
         return txt, style
-    
+
     def _parse_img(self, tag):
         """Parse img tags."""
         src = tag.get('src', '')
+        if not src:
+            return ''
+        if INLINE_PREVIEWS and tag.parent.name == 'a':
+            if tag.parent.get('href').split('.')[-1] in _EMBEDDED_FILES:
+                return ''  # preview image; discard, file is linked directly
+
         if '://' in src:
             logging.warning(f"External image found: {tag['src']}")
         else:
             self.resources.append(src)
-            src = quote(src.replace('\\', '/'))
+            src = _quote(src)
 
         name = tag.get('data-filename', "")[:-4] or tag.get('alt', "")
         name = os.path.basename(src) if not name else name
@@ -375,9 +422,11 @@ class HTMLParser():
         if IMAGE_MODE == 'html':        # Joplin does not support MD images
             attr = ' '.join([f"{k}=\"{v}\"" for k, v in attr.items() if v])
             return f"<img {attr}>"
-        elif IMAGE_MODE == 'markdown':  # for eg Obisidian
+        elif IMAGE_MODE in ('markdown', 'wiki'):  # for eg Obisidian
             size = f"|{attr['width']}" if attr['width'] else ""
             size += f"x{attr['height']}" if attr['height'] else ""
+            if IMAGE_MODE == 'wiki':
+                return f"![[{unquote(attr['src'])}|{attr['alt']}{size}]]"
             return f"![{attr['alt']}{size}]({attr['src']})"
 
         raise ValueError("Unknown image mode: {IMAGE_MODE}")
@@ -431,7 +480,9 @@ class HTMLParser():
             for cell in row:
                 while table[i][col] is not None:  # first non-empty cell
                     col += 1
-                table[i][col] = _parse_cell(cell).replace('\n', '<br>')
+                txt = _parse_cell(cell).replace('\n', '<br>')
+                # null string merges cells
+                table[i][col] = txt if txt else '&nbsp;'
 
                 if cell.get('colspan', 1) != 1:
                     for j in range(1, int(cell['colspan'])):
@@ -496,14 +547,16 @@ class HTMLParser():
                 # if multiple children, their style overrides the parent
                 style.update(decode_style(tag.get('style', '')))
         elif tag.name == 'hr':  # horizontal rule
-            txt = f"\n----\n\n"
+            txt = f"\n\n----\n\n"
         elif tag.name.startswith('h'):  # heading
             style = decode_style(tag.get('style', ''), _parse_div_style)
-            style['heading'] = int(tag.name[1])
+            txt, style = _format(txt, style), {}
+            if txt:
+                txt = f"\n\n{'#' * int(tag.name[1])} {txt.strip()}\n\n"
         elif tag.name == 'a':
             txt, style = self._parse_link(tag, txt, style)
         elif tag.name == 'img':
-            txt =self._parse_img(tag)
+            txt = self._parse_img(tag)
         elif tag.name == 'font':
             font = tag.get('face', "").split(',')[0].strip("'").lower()
             style['code'] = font in _MONOSPACE_FONTS or decode_style(
@@ -511,9 +564,12 @@ class HTMLParser():
             if font and font not in _KNOWN_FONTS:
                 logging.warning(f"Unknown font: {font}")
         elif tag.name == 'blockquote':
-            txt = '\n\n> ' + txt.strip() + '\n\n'
+            txt = f"\n> {txt.strip()}\n"
+            if not tag.findPrevious('blockquote'):
+                txt = f"\n{txt}"
+            txt += '\n' if not tag.findNext('blockquote') else '>'
         elif tag.name == 'p':
-            txt = f"{txt}\n"
+            txt = f"\n{txt}\n"
             if tag.get('align', ''):
                 style['align'] = tag['align']
         elif tag.name == 'br':
@@ -525,11 +581,13 @@ class HTMLParser():
                 txt = '  ' + txt.replace('\n', '\n  ')
             elif parent.name == 'ol':
                 txt = '   ' + txt.replace('\n', '\n   ')
-            txt = f"\n\n{txt}\n\n"
+            txt = f"\n{txt}\n" if parent.name in ('ul', 'ol') \
+                else f"\n\n{txt}\n\n"
         elif tag.name == 'li':
             if next(tag.children).name not in ('ul', 'ol'):
                 mark = '- ' if tag.parent.name == 'ul' else '1. '
-                txt = f"{mark}{txt.strip()}\n"
+                txt, style = _format(txt.strip(), style), {}
+                txt = f"{mark}{txt}\n"
         elif tag.name == 'u':
             style['underline'] = True
         elif tag.name in ('del', 'strike', 's'):
@@ -581,10 +639,13 @@ def _convert_file(path, fname, out_dir='', is_test=False):
     out_name, _ = os.path.splitext(fname)
     txt, parser = convert_html_to_markdown(
         os.path.join(path, fname))
+    
+    if out_name != parser.meta['title']:
+        logging.warning(f"Modified note name: {out_name}")
 
     if not is_test:
         if out_dir:
-            out_path = os.path.join(out_dir, parser.path)
+            out_path = os.path.join(out_dir, 'Notes', parser.path)
             os.makedirs(out_path, exist_ok=True)
         else:
             out_path = path
@@ -664,9 +725,12 @@ def main():
             links += [(path, f) for f in internal_links if f not in converted]
 
     if args.mode == 'recursive':
-        print("\nMissing files:")
-        for fname in set(all_files) - set(converted):
-            print(f"{fname}")
+        missing = list(set(all_files) - set(converted))
+        print(f"Not converting {len(missing)} files.")
+        if len(missing) < 30:
+            print("\nMissing files:\n--------------")
+            for fname in missing:
+                print(f"{fname}")
     elif args.mode == 'all':
         print("\nMissing links:\n--------------")
         links = [set(l) for l in converted.values()]
