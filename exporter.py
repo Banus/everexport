@@ -47,7 +47,8 @@ def parse_span_style(tokens):
     style['sup'] = tokens.get('vertical-align', None) == 'super'
     style['code'] = "courier" in tokens.get('font-family', "").lower()
     style['color'] = tokens.get('color', False)
-    style['highlight'] = tokens.get('background-color', False)
+    style['highlight'] = tokens.get('background-color', 'white') not in \
+        ("rgb(255, 255, 255)", "white", "#FFFFFF", "transparent")
 
     return {k: v for k, v in style.items() if v}  # drop useless attributes
 
@@ -57,6 +58,8 @@ def _parse_div_style(tokens):
     style['codeblock'] = tokens.get("-en-codeblock", "") == "true"
     align = tokens.get('text-align', '').lower()
     style['align'] = align if align in ('center', 'right') else ''
+    style['is_p'] = tokens.get('margin-top', '') == '1em' and \
+        tokens.get('margin-bottom', '') == '1em'
 
     return {k: v for k, v in style.items() if v}  # drop useless attributes
 
@@ -102,7 +105,9 @@ def decode_style(prop, parser=parse_span_style):
 def _clean_code_block(string):
     """Clean code blocks."""
     # spaces are non-breaking in code; remove leading/trailing spaces
-    string = string.replace("&nbsp;", " ")
+    string = string.replace('&nbsp;', ' ')
+    # revert escaped sequences
+    string = re.sub(r'(\d)\\([\.\)])\s', r'\g<1>\g<2> ', string)
     string = _unescape(string.replace(chr(160), " ").strip())
 
     if not string:  # nothing left
@@ -113,8 +118,8 @@ def _clean_code_block(string):
 
 def _format_link(link, string):
     """Format a link, optionally as a wikilink."""
-    # no need to escape in links, but nbsp are not correctly rendered
-    string = _unescape(string).replace(chr(160), ' ')
+    # no need to escape in links, but nbsp, \n are not correctly rendered
+    string = _unescape(string).replace(chr(160), ' ').replace('\n\n', '\n')
     # fix square brackets in link messing up formatting
     if string.endswith(']'):
         string += ' '
@@ -142,13 +147,17 @@ def _apply_style(string, attr):
     if attr.get('link', None):
         string = _format_link(attr['link'], string)
     if attr.get('italic', False):
-        string = f"*{string}*"
+        if string.startswith('*') or string.endswith('*'):
+            string = f"_{string}_"
+        else:
+            string = f"*{string}*"
     if attr.get('bold', False):
-        string = f"**{string}**"
+        if string.startswith('*') or string.endswith('*'):
+            string = f"__{string}__"
+        else:
+            string = f"**{string}**"
     if attr.get('strikethrough', False):
         string = f"~~{string}~~"
-    if attr.get('highlight', False):
-        string = f"=={string}=="
     if attr.get('abbr', None):
         string = f"<abbr title=\"{attr['abbr']}\">{string}</abbr>"
     if attr.get('sup', False):
@@ -159,6 +168,8 @@ def _apply_style(string, attr):
         string = f"<u>{string}</u>"
     if attr.get('color', False):
         string = f"<span style=\"color: {attr['color']}\">{string}</span>"
+    if attr.get('highlight', False):
+        string = f"=={string}=="
     if attr.get('align', '') and attr['align'] in ('center', 'right'):
         string = string.replace('\n', '<br>')  # only BR works with divs
         string = f"<div align=\"{attr['align']}\">{string}</div>"
@@ -182,23 +193,24 @@ def _format(string, attr, warn=True):
         lang = attr.get('lang', 'bash')
         return f"\n\n```{lang}\n{_clean_code_block(string)}\n```\n\n"
 
-    if attr.get('code', ''):
-        # spaces are non-breaking in code; remove leading/trailing spaces
-        string = _clean_code_block(string)
-        if not string:
-            return ""
-        
+    if attr.get('code', ''):     
         if attr['code'] == 'html':
             string = f"<code>{string}</code>"
-        elif '`' in string:
-            # avoid rendering errors when the code contains backticks
-            if string.startswith('`'):
-                string = ' ' + string
-            if string.endswith('`'):
-                string += ' '
-            string = f"``{string}``"
         else:
-            string = f"`{string}`"
+            # spaces are non-breaking in code; remove leading/trailing spaces
+            string = _clean_code_block(string)
+            if not string:
+                return ""
+
+            if '`' in string:
+                # avoid rendering errors when the code contains backticks
+                if string.startswith('`'):
+                    string = ' ' + string
+                if string.endswith('`'):
+                    string += ' '
+                string = f"``{string}``"
+            else:
+                string = f"`{string}`"
 
     if attr.get('color', "") in ("rgb(0, 0, 0)", "black", "#000000"):
         attr.pop('color')  # remove default color
@@ -236,15 +248,18 @@ def _format_spans(spans):
 
 def _replace_cr_except_code(txt, cr_):
     """Replace single newlines except for bullet lists and code blocks."""
-    codeblocks = list(re.finditer(r"```bash([\S|\s]+?)```", txt))
+    def _nbsp(x):
+        return '\n\n ' + '&nbsp;'*len(x.group(1)) + x.group(2)
+
+    codeblocks = list(re.finditer(r"```([\S|\s]+?)```", txt))
 
     steps = [0] + list(chain(*[c.span() for c in codeblocks])) + [len(txt)]
     segs = [txt[s:e] for s, e in zip(steps[:-1], steps[1:])]
 
     for idx, seg in enumerate(segs):
         if idx % 2 == 0:  # normal text
-            # escape combinations mimiking a numbered list
-            seg = re.sub(r'(\d)([\.\)]) ', r'\g<1>\\\g<2> ', seg)
+            # remove whitespace mimiking code blocks
+            seg = re.sub(r"\n\n( {4,})([^-\s1])", _nbsp, seg)
             # add single newlines but not for lists, tables and definitions
             seg = re.sub(r"(\S)\n(?!\n| *[\|\-|1|:|>])", rf"\1 {cr_}\n", seg)
 
@@ -273,7 +288,8 @@ def print_metadata(meta):
         meta['created'] = _reformat_date(meta['created'])
 
     title = meta.get('title', '')
-    if title and ':' in title:  # wrap title in quotes if it contains a colon
+    if title and any(c in title for c in ':\'"'): 
+        # wrap title in quotes if it contains a bad characters
         meta['title'] = f'"{title}"' if '"' not in title else f"'{title}'"
 
     keys_ordered = ('title', 'updated', 'created', 'source', 'location',
@@ -285,8 +301,9 @@ def print_metadata(meta):
 
 def finalize(txt, cr_="<br>"):
     """Clean up residual formatting."""
-    # fix special characters
-    txt = txt.replace(chr(160), "&nbsp;").replace('\t', '    ')
+    # fix nbsp and tabs
+    txt = txt.replace(chr(160), "&nbsp;").replace(
+        '\t', '    ')
     txt = txt.replace(codecs.BOM_UTF8.decode('utf-8'), "")
 
     # nbsp not at line start are spaces
@@ -303,6 +320,13 @@ def finalize(txt, cr_="<br>"):
     txt = _replace_cr_except_code(txt.strip(), cr_) + '\n'
 
     return txt.strip() + '\n'
+
+
+def _lookahead(tags, name):
+    """Check next tag in a list, discarding strings."""
+    previous = next((t for t in tags if not isinstance(t, NavigableString)),
+                    None)
+    return previous and previous.name == 'blockquote'
 
 
 class HTMLParser():
@@ -379,7 +403,7 @@ class HTMLParser():
 
         if ':' not in link:  # internal link
             if link.endswith('.html'):
-                self.internal_links.append(link)
+                self.internal_links.append(unquote(link))
                 link = link.replace(".html", ".md")
             else:
                 self.resources.append(link)
@@ -405,11 +429,13 @@ class HTMLParser():
         if not src:
             return ''
         if INLINE_PREVIEWS and tag.parent.name == 'a':
-            if tag.parent.get('href').split('.')[-1] in _EMBEDDED_FILES:
+            if tag.parent.get('href', '').split('.')[-1] in _EMBEDDED_FILES:
                 return ''  # preview image; discard, file is linked directly
 
+        mode = IMAGE_MODE
         if '://' in src:
             logging.warning(f"External image found: {tag['src']}")
+            mode = 'markdown' if mode == 'wiki' else mode
         else:
             self.resources.append(src)
             src = _quote(src)
@@ -480,7 +506,8 @@ class HTMLParser():
             for cell in row:
                 while table[i][col] is not None:  # first non-empty cell
                     col += 1
-                txt = _parse_cell(cell).replace('\n', '<br>')
+                txt = _parse_cell(cell)
+                txt = txt.replace('\n', '<br>').replace('|', r'\|')
                 # null string merges cells
                 table[i][col] = txt if txt else '&nbsp;'
 
@@ -519,7 +546,12 @@ class HTMLParser():
             if not tag.name and 'code' not in style:
                 txt = txt.replace('\n', ' ')  # no newlines in HTML text
                 if tag.parent.name in ('ul', 'ol'):
-                    txt = txt.strip()   # avoid spaces messing up lists
+                    # avoid spaces messing up lists
+                    txt = txt.strip(_WHITESPACE)
+                # divs add new lines
+                if old_txt and tag.previous_sibling.name == 'div':
+                    if not old_txt.endswith('\n') and txt.strip(_WHITESPACE):
+                        txt = '\n' + txt
             chunks.append(_format(txt, style))
 
         return ''.join(chunks)
@@ -527,7 +559,10 @@ class HTMLParser():
     def process_tag(self, tag):
         """Process a tag."""
         if isinstance(tag, NavigableString):
-            return _escape(str(tag)), {}
+            txt = _escape(str(tag))
+            # escape combinations mimicking a numbered list
+            txt = re.sub(r'(\d)([\.\)])\s', r'\g<1>\\\g<2> ', txt)
+            return txt, {}
 
         style, txt, children = {}, tag.text, list(tag.children)
         if tag.name not in ('table', 'dl'):  # skip custom tree tags
@@ -538,55 +573,72 @@ class HTMLParser():
 
         if tag.name == 'div':
             div_style = decode_style(tag.get('style', ''), _parse_div_style)
+            if div_style.pop('is_p', False):
+                txt = f'\n{txt}\n'
             if div_style.get('codeblock', False):
                 style['codeblock'], style['lang'] = True, 'bash'
         elif tag.name == 'pre':  # pre-formatted text
             style['codeblock'], style['lang'] = True, ''
         elif tag.name == 'span':
-            if len(children) <= 1:
-                # if multiple children, their style overrides the parent
-                style.update(decode_style(tag.get('style', '')))
+            style.update(decode_style(tag.get('style', '')))
+            if style.get('code', False) and len(children) > 1:
+                style['code'] = 'html'  # children may be formetted
         elif tag.name == 'hr':  # horizontal rule
             txt = f"\n\n----\n\n"
         elif tag.name.startswith('h'):  # heading
             style = decode_style(tag.get('style', ''), _parse_div_style)
             txt, style = _format(txt, style), {}
             if txt:
-                txt = f"\n\n{'#' * int(tag.name[1])} {txt.strip()}\n\n"
+                txt = txt.strip().replace('\n', ' ')  # no newlines in headings
+                txt = f"\n\n{'#' * int(tag.name[1])} {txt}\n\n"
         elif tag.name == 'a':
             txt, style = self._parse_link(tag, txt, style)
         elif tag.name == 'img':
             txt = self._parse_img(tag)
+            next_tag = tag.next_sibling
+            if next_tag and isinstance(next_tag, NavigableString):
+                txt += '\n'
         elif tag.name == 'font':
             font = tag.get('face', "").split(',')[0].strip("'").lower()
+            if tag.get('color', ''):
+                style['color'] = tag['color']
             style['code'] = font in _MONOSPACE_FONTS or decode_style(
                 tag.get('style', ""), _parse_font_style).get('code', False)
             if font and font not in _KNOWN_FONTS:
                 logging.warning(f"Unknown font: {font}")
         elif tag.name == 'blockquote':
             txt = f"\n> {txt.strip()}\n"
-            if not tag.findPrevious('blockquote'):
+            if not _lookahead(tag.find_previous_siblings(), 'blockquote'):
                 txt = f"\n{txt}"
-            txt += '\n' if not tag.findNext('blockquote') else '>'
+            txt += '\n' if \
+                not _lookahead(tag.find_next_siblings(), 'blockquote') else '>'
         elif tag.name == 'p':
-            txt = f"\n{txt}\n"
+            txt = f"\n\n{txt}\n\n"
             if tag.get('align', ''):
                 style['align'] = tag['align']
         elif tag.name == 'br':
             txt = '\n'
         elif tag.name in ('ul', 'ol'):
             parent = tag.parent
-            parent = parent.parent if parent.name == 'li' else parent
+            nl = ''
+            if parent.name == 'li':
+                if next(parent.children).name != tag.name:
+                    nl = '\n'  # content in list tag, start new line
+                parent = parent.parent
             if parent.name == 'ul':  # nested list, pad with space
                 txt = '  ' + txt.replace('\n', '\n  ')
             elif parent.name == 'ol':
                 txt = '   ' + txt.replace('\n', '\n   ')
-            txt = f"\n{txt}\n" if parent.name in ('ul', 'ol') \
+            txt = f"{nl}{txt.rstrip()}\n" if parent.name in ('ul', 'ol') \
                 else f"\n\n{txt}\n\n"
         elif tag.name == 'li':
-            if next(tag.children).name not in ('ul', 'ol'):
+            first = next(tag.children)
+            if first and first.name == 'a':  # skip anchors
+                first = first.next_sibling
+            if not first or first.name not in ('ul', 'ol'):
                 mark = '- ' if tag.parent.name == 'ul' else '1. '
-                txt, style = _format(txt.strip(), style), {}
+                txt = re.sub(r'\n\s*\n', r'\n', txt.strip())
+                txt, style = _format(txt, style), {}
                 txt = f"{mark}{txt}\n"
         elif tag.name == 'u':
             style['underline'] = True
@@ -641,7 +693,7 @@ def _convert_file(path, fname, out_dir='', is_test=False):
         os.path.join(path, fname))
     
     if out_name != parser.meta['title']:
-        logging.warning(f"Modified note name: {out_name}")
+        logging.info(f"Modified note name: {out_name}")
 
     if not is_test:
         if out_dir:
@@ -651,7 +703,8 @@ def _convert_file(path, fname, out_dir='', is_test=False):
             out_path = path
 
         out_file = os.path.join(out_path, f"{out_name}.md")
-        with open(out_file, 'w', encoding="utf-8") as fid:
+        # Obsidian uses LF also in Windows
+        with open(out_file, 'w', encoding="utf-8", newline='\n') as fid:
             fid.write(txt)
 
         if out_dir and parser.resources:
@@ -709,11 +762,12 @@ def main():
 
 
     path = os.path.dirname(args.path)
-    all_files = sorted(f for f in os.listdir(path) if f.endswith('.html'))
+    all_files = sorted(f for f in os.listdir(path) if f.endswith('.html') and
+                       not f.startswith('Evernote_index'))
     all_files = all_files[::-1]  # to have ascending order with pop()
     links = [(path, f) for f in all_files] \
         if args.mode == 'all' else [os.path.split(args.path)]
-    
+
     converted = {}
     start = time.time()
     while links:

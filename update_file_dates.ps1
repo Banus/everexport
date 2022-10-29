@@ -5,19 +5,19 @@ $files = Get-ChildItem $Dir -Recurse -Name -Filter "*.md"
 
 foreach ($file in $files) {
     $file = $Dir + "\" + $file
-    $createdDate = Get-Content $file | Select -Index 3
+    $createdDate = Get-Content -LiteralPath $file | Select -Index 3
     $createdDate = $createdDate -replace 'created: ',''
     
     if ([string]$createdDate -as [DateTime]) {  
-        $(Get-Item "$file").creationtime=$("$createdDate")
+        $(Get-Item -LiteralPath $file).creationtime=$("$createdDate")
     }
     else { Write-Host "Error setting creation date for: $file" }
 
-    $modifiedDate = Get-Content $file | Select -Index 2
+    $modifiedDate = Get-Content -LiteralPath $file | Select -Index 2
     $modifiedDate = $modifiedDate -replace 'updated: ',''
     
     if ([string]$modifiedDate -as [DateTime]) {  
-        $(Get-Item "$file").LastWriteTime=$("$modifiedDate")
+        $(Get-Item -LiteralPath $file).LastWriteTime=$("$modifiedDate")
     }
     else { Write-Host "Error setting modification date for: $file" }
 }
