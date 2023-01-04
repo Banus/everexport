@@ -133,7 +133,10 @@ def _format_link(link, string):
         if not lnk.endswith(' '):
             return f"[[{lnk}]]" if lnk == string else f"[[{lnk}|{string}]]"
 
-    return f"[{string}]({_quote(link)})"
+    if not link.startswith('http'):
+        link = _quote(link)  # quote only internal links
+
+    return f"[{string}]({link})"
 
 def _apply_style(string, attr):
     """Apply Markdown formatting to text."""
