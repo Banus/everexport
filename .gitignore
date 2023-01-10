@@ -3,8 +3,8 @@
 __pycache__
 
 # export tests
-ever/
-md/
+original/
+converted/
 
 # local test files
 *.md
